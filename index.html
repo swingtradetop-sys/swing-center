@@ -1,0 +1,1190 @@
+<!DOCTYPE html>
+<html lang="sk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swing Command Center</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>html,body{margin:0;padding:0;background:#0F1319}#root{min-height:100vh}</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+// fallback úložisko, ak window.storage nie je k dispozícii (napr. otvorené mimo Claude)
+if (!window.storage) {
+  (function(){
+    var mem = {};
+    try { var saved = localStorage.getItem('swing-ptf-fallback'); if (saved) mem = JSON.parse(saved); } catch(e){}
+    function persist(){ try { localStorage.setItem('swing-ptf-fallback', JSON.stringify(mem)); } catch(e){} }
+    window.storage = {
+      get: function(k){ return Promise.resolve(mem[k] != null ? {key:k, value:mem[k]} : null); },
+      set: function(k,v){ mem[k]=v; persist(); return Promise.resolve({key:k, value:v}); },
+      "delete": function(k){ delete mem[k]; persist(); return Promise.resolve({key:k, deleted:true}); },
+      list: function(){ return Promise.resolve({keys:Object.keys(mem)}); }
+    };
+  })();
+}
+</script>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef, useCallback } = React;
+
+/* ============================================================
+   SWING COMMAND CENTER — implementácia "Swing strategia v1.0"
+   Kategórie: A Long swing / B Swing / C Špekulácia
+   Dáta: import z IBKR (CSV/TSV paste), trhové dáta cez vlastný
+   API kľúč (Twelve Data), AI analytik cez Anthropic API + web search
+   ============================================================ */
+
+const C = {
+  bg: "#0F1319", panel: "#171D26", panel2: "#1C2430", line: "#26303D",
+  text: "#DCE3EB", mut: "#8C97A6", dim: "#5C6675",
+  ok: "#46B17B", warn: "#E2A33B", bad: "#DE5959", info: "#6AA5D8", amber: "#E2A33B",
+};
+const MONO = "ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, monospace";
+const SANS = "-apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
+
+const CATS = {
+  long: { label: "Long swing", short: "A · LONG", maxPct: 0.10, maxCount: 10, slHint: "−20–25 % / 200d MA / téza", color: "#6AA5D8" },
+  swing: { label: "Swing", short: "B · SWING", maxPct: 0.06, maxCount: 5, slHint: "−7–10 % tvrdý, pod swing low", color: "#46B17B" },
+  spec: { label: "Špekulácia", short: "C · ŠPEK", maxPct: 0.03, maxCount: 3, slHint: "−10–15 % bracket, nikdy neposúvať", color: "#E2A33B" },
+};
+const THEMES = ["AI infraštruktúra", "Energia / jadro / utility", "Fintech / EM spotreba", "Softvér / platformy", "Drahé kovy (hedž)", "Špekulácie / krypto", "Iné"];
+
+const DEFAULT_SETTINGS = {
+  nlv: 14000, excessLiq: 4950, maxLevNormal: 1.3, maxLevCrash: 1.5,
+  minExcessPct: 0.30, maxPositions: 16, maxThemePct: 0.40,
+  riskTrancheSwing: 0.01, riskTrancheLong: 0.015, reserve: 1800,
+  tdKey: "", autoRefreshMin: 0, vixManual: "",
+  cloudUrl: "", cloudAuto: true, stateSync: true,
+  longBePct: 30, rulesChangedAt: "",
+  catRules: {
+    long: { maxPct: 0.10, maxCount: 10, slPct: 22, tranches: "40/30/30", dokupGap: 8, timeStopDays: 0 },
+    swing: { maxPct: 0.06, maxCount: 5, slPct: 8, tranches: "50/25/25", dokupGap: 0, timeStopDays: 56 },
+    spec: { maxPct: 0.03, maxCount: 3, slPct: 12, tranches: "50/25/25", dokupGap: 0, timeStopDays: 21 },
+  },
+};
+const catRule = (s, k) => ({ ...DEFAULT_SETTINGS.catRules[k], ...((s.catRules || {})[k] || {}) });
+
+const DEFAULT_POSITIONS = [
+  { id: "p1", ticker: "MSFT", cat: "long", theme: "AI infraštruktúra", thesis: "Cloud+AI monetizácia, držím kým rastie Azure >20 %", date: "2026-05-12", qty: 3, avg: 440, manualPrice: 455, sl: 380, tp1: 510, note: "1. tranža 40 %" },
+  { id: "p2", ticker: "TSM", cat: "long", theme: "AI infraštruktúra", thesis: "Monopol na špičkové čipy, capex cyklus AI", date: "2026-04-03", qty: 6, avg: 195, manualPrice: 210, sl: 165, tp1: 260, note: "1.+2. tranža" },
+  { id: "p3", ticker: "DUOL", cat: "swing", theme: "Softvér / platformy", thesis: "Breakout z bázy + earnings katalyzátor", date: "2026-06-01", qty: 2, avg: 480, manualPrice: 492, sl: 445, tp1: 560, note: "vstup 50 %" },
+  { id: "p4", ticker: "MARA", cat: "spec", theme: "Špekulácie / krypto", thesis: "BTC momentum, čisto technický trade", date: "2026-06-08", qty: 20, avg: 17.5, manualPrice: 18.2, sl: 15.5, tp1: 22, note: "bracket zadaný" },
+];
+
+const DEFAULT_WATCHLIST = [
+  { id: "w1", level: "A", ticker: "CEG", theme: "Energia / jadro / utility", thesis: "Dopyt po elektrine pre AI dátové centrá", catalyst: "Earnings 08/2026", zoneLow: 280, zoneHigh: 295, sl: 255, size: 1200, invalidate: "Pokles PPA cien / regulácia" },
+  { id: "w2", level: "B", ticker: "MELI", theme: "Fintech / EM spotreba", thesis: "E-commerce + fintech penetrácia LatAm", catalyst: "", zoneLow: "", zoneHigh: "", sl: "", size: "", invalidate: "Devalvácia / konkurencia" },
+];
+
+/* ---------------- indikátory ---------------- */
+const sma = (a, n) => (a.length < n ? null : a.slice(-n).reduce((s, x) => s + x, 0) / n);
+function rsi(closes, n = 14) {
+  if (closes.length < n + 1) return null;
+  let g = 0, l = 0;
+  for (let i = 1; i <= n; i++) { const d = closes[i] - closes[i - 1]; if (d > 0) g += d; else l -= d; }
+  let ag = g / n, al = l / n;
+  for (let i = n + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    ag = (ag * (n - 1) + Math.max(d, 0)) / n;
+    al = (al * (n - 1) + Math.max(-d, 0)) / n;
+  }
+  return al === 0 ? 100 : 100 - 100 / (1 + ag / al);
+}
+function atr(bars, n = 14) {
+  if (bars.length < n + 1) return null;
+  const trs = [];
+  for (let i = 1; i < bars.length; i++) {
+    const b = bars[i], p = bars[i - 1];
+    trs.push(Math.max(b.h - b.l, Math.abs(b.h - p.c), Math.abs(b.l - p.c)));
+  }
+  let a = trs.slice(0, n).reduce((s, x) => s + x, 0) / n;
+  for (let i = n; i < trs.length; i++) a = (a * (n - 1) + trs[i]) / n;
+  return a;
+}
+function computeIndicators(values) {
+  // values: newest-first from Twelve Data
+  const bars = [...values].reverse().map(v => ({ o: +v.open, h: +v.high, l: +v.low, c: +v.close, v: +v.volume || 0, d: v.datetime }));
+  if (bars.length < 2) return null;
+  const closes = bars.map(b => b.c);
+  const last = bars[bars.length - 1], prev = bars[bars.length - 2];
+  const vols = bars.map(b => b.v).filter(v => v > 0);
+  const avgVol20 = vols.length >= 20 ? vols.slice(-21, -1).reduce((s, x) => s + x, 0) / 20 : null;
+  const a = atr(bars.slice(-120));
+  return {
+    price: last.c, prevClose: prev.c, changePct: (last.c / prev.c - 1) * 100,
+    gapPct: prev.c ? (last.o / prev.c - 1) * 100 : 0,
+    sma20: sma(closes, 20), sma50: sma(closes, 50), sma200: sma(closes, 200),
+    rsi14: rsi(closes.slice(-120)), atr14: a, atrPct: a ? (a / last.c) * 100 : null,
+    vol: last.v, avgVol20, volRatio: avgVol20 ? last.v / avgVol20 : null,
+    hi20: Math.max(...closes.slice(-20)), lo20: Math.min(...closes.slice(-20)),
+    lastDate: last.d, ts: Date.now(),
+  };
+}
+
+/* ---------------- formátovanie ---------------- */
+const f0 = (x) => x == null || isNaN(x) ? "—" : Math.round(x).toLocaleString("sk-SK");
+const f2 = (x) => x == null || isNaN(x) ? "—" : (+x).toLocaleString("sk-SK", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fp = (x, d = 1) => x == null || isNaN(x) ? "—" : `${x >= 0 ? "+" : ""}${(+x).toFixed(d)} %`;
+const fpn = (x, d = 1) => x == null || isNaN(x) ? "—" : `${(+x).toFixed(d)} %`;
+const sevColor = (s) => s === "bad" ? C.bad : s === "warn" ? C.warn : s === "ok" ? C.ok : C.info;
+
+/* ---------------- mini markdown render ---------------- */
+function Md({ text }) {
+  if (!text) return null;
+  const lines = String(text).split("\n");
+  const out = [];
+  let list = [];
+  const flush = (k) => { if (list.length) { out.push(<ul key={"u" + k} style={{ margin: "4px 0 10px", paddingLeft: 18 }}>{list}</ul>); list = []; } };
+  const inline = (s) => {
+    const parts = s.split(/(\*\*[^*]+\*\*)/g);
+    return parts.map((p, i) => p.startsWith("**") && p.endsWith("**")
+      ? <strong key={i} style={{ color: C.text }}>{p.slice(2, -2)}</strong> : p);
+  };
+  lines.forEach((ln, i) => {
+    const t = ln.trim();
+    if (/^#{1,4}\s/.test(t)) { flush(i); out.push(<div key={i} style={{ fontWeight: 700, color: C.amber, margin: "12px 0 4px", fontSize: 13, textTransform: "uppercase", letterSpacing: ".06em" }}>{t.replace(/^#+\s/, "")}</div>); }
+    else if (/^[-•*]\s/.test(t)) list.push(<li key={i} style={{ margin: "2px 0" }}>{inline(t.replace(/^[-•*]\s/, ""))}</li>);
+    else if (t === "") flush(i);
+    else { flush(i); out.push(<p key={i} style={{ margin: "4px 0" }}>{inline(t)}</p>); }
+  });
+  flush("end");
+  return <div style={{ fontSize: 13, lineHeight: 1.55, color: C.text }}>{out}</div>;
+}
+
+/* ---------------- AI volanie ---------------- */
+async function askClaude(prompt, useSearch = true) {
+  const body = {
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 1000,
+    messages: [{ role: "user", content: prompt }],
+  };
+  if (useSearch) body.tools = [{ type: "web_search_20250305", name: "web_search" }];
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const data = await r.json();
+  if (data.error) throw new Error(data.error.message || "API chyba");
+  return (data.content || []).map(b => (b.type === "text" ? b.text : "")).filter(Boolean).join("\n");
+}
+
+const STRATEGY_BRIEF = `Pravidlá portfólia (Swing stratégia v1.0):
+- Kategórie: A Long swing (6–24 mes., max 10 % NLV/pozícia, mäkký SL −20–25 % alebo 200d MA alebo zlom tézy; pri +50 % predaj 1/4, +100 % ďalšiu 1/4; po +30 % SL na break-even),
+  B Swing (2 týž.–4 mes., max 6 % NLV, tvrdý SL −7–10 % pod swing low; 1/2 na +2R, po +1R SL na BE; časový stop 6–8 týždňov bez pohybu),
+  C Špekulácia (dni–týždne, max 3 % NLV, tvrdý SL −10–15 % bracket, 1/2 na +20–30 %, časový stop 2–3 týždne, nedržať vo veľkom cez earnings).
+- Riziko na tranžu max 1 % NLV (B/C) resp. 1,5 % (A). Páka max 1,3× normál, 1,5× absolútny strop. Excess Liquidity min 30 % NLV.
+- Max 16 pozícií, max 40 % NLV na jednu tému. Do straty dokupuje len A s platnou tézou; B a C nikdy.
+- Pri SPY −7 % od maxima: stop novým B/C vstupom, dotiahnuť SL. Pred earnings/CPI/FOMC žiadne nové vstupy.`;
+
+/* ---------------- pravidlový engine ---------------- */
+function buildAlerts(state, derived) {
+  const { settings: s, positions } = state;
+  const { totals, themes, byCat, mkt } = derived;
+  const A = [];
+  const add = (sev, scope, msg, action) => A.push({ sev, scope, msg, action });
+
+  // Účet
+  if (totals.lev > s.maxLevCrash) add("bad", "ÚČET", `Páka ${totals.lev.toFixed(2)}× nad absolútnym stropom ${s.maxLevCrash}×`, "Okamžite redukovať — najprv špekulácie, potom najslabšie swingy (kap. 3.4).");
+  else if (totals.lev > s.maxLevNormal) add("warn", "ÚČET", `Páka ${totals.lev.toFixed(2)}× nad limitom ${s.maxLevNormal}× pre normálny trh`, "Redukuj na ≤1,3×; nové vstupy zakázané (Desatoro č. 1).");
+  if (s.excessLiq < s.minExcessPct * s.nlv) add("bad", "ÚČET", `Excess Liquidity ${f0(s.excessLiq)} € < ${Math.round(s.minExcessPct * 100)} % NLV (${f0(s.minExcessPct * s.nlv)} €)`, "Znižuj páku, kým vankúš nie je obnovený.");
+  const elVsPos = totals.value > 0 ? s.excessLiq / totals.value : 1;
+  if (elVsPos < 0.15) add("bad", "ÚČET", `Excess Liq je len ${(elVsPos * 100).toFixed(0)} % hodnoty pozícií — poistka z kap. 3.4`, "Predávaj podľa poradia: špekulácie → slabé swingy → najslabší long swing.");
+  if (positions.length > s.maxPositions) add("warn", "ÚČET", `${positions.length} pozícií > limit ${s.maxPositions}`, "Konsoliduj — zombie pozície von.");
+  if (totals.riskPct > 0.08) add("warn", "ÚČET", `Otvorené riziko ${(totals.riskPct * 100).toFixed(1)} % NLV > 8 %`, "Dotiahni SL alebo zmenši pozície.");
+
+  // Kategórie
+  Object.entries(CATS).forEach(([k, c]) => {
+    const cr = catRule(s, k);
+    if (byCat[k].count > cr.maxCount) add("warn", "KATEGÓRIE", `${c.label}: ${byCat[k].count} pozícií > max ${cr.maxCount}`, "Zredukuj počet.");
+  });
+  const specVal = byCat.spec.value;
+  if (specVal > 0.10 * s.nlv) add("warn", "KATEGÓRIE", `Špekulácie ${f0(specVal)} € > 10 % NLV`, "Špekulácie súhrnne max 10 % NLV (kap. 2.4).");
+
+  // Témy
+  themes.forEach(t => {
+    if (t.pct > s.maxThemePct) add("warn", "TÉMY", `Téma „${t.name}“ = ${(t.pct * 100).toFixed(0)} % NLV > ${Math.round(s.maxThemePct * 100)} %`, "Jedna stávka, veľa tickerov — zredukuj na 1–2 najsilnejšie mená.");
+  });
+
+  // Trh
+  if (mkt.spy) {
+    if (mkt.spy.sma50 && mkt.spy.price < mkt.spy.sma50) add("warn", "TRH", "SPY pod 50d MA — režim risk-off", "Žiadne nové B/C vstupy bez výnimky; dotiahnuť SL (kap. 2.1).");
+    if (mkt.spy.hiAll && mkt.spy.price < mkt.spy.hiAll * 0.93) add("warn", "TRH", `SPY ${((mkt.spy.price / mkt.spy.hiAll - 1) * 100).toFixed(1)} % od maxima (cez −7 %)`, "Obranný režim: stop novým vstupom, páka pod 1,1× (kap. 2.5).");
+  }
+  const vix = parseFloat(s.vixManual);
+  if (!isNaN(vix) && vix > 28) add("warn", "TRH", `VIX ${vix} > 28 — zvýšené riziko`, "Páka ≤1,0×, žiadny margin úver (kap. 4).");
+
+  // Pozície
+  derived.rows.forEach(r => {
+    const p = r.p;
+    const cr = catRule(s, p.cat);
+    if (!p.thesis || p.thesis.trim().length < 5) add("warn", p.ticker, "Chýba téza jednou vetou", "„Vlastním X, lebo Y, držím kým platí Z“ — inak pozícia nepatrí do portfólia.");
+    if (!p.sl) add("bad", p.ticker, "Chýba stop-loss", "SL je zadaný, nie myslený (Desatoro č. 5).");
+    if (r.pctNlv > cr.maxPct * 1.02) add("warn", p.ticker, `${(r.pctNlv * 100).toFixed(1)} % NLV > max ${(cr.maxPct * 100).toFixed(0)} % pre ${CATS[p.cat].label}`, "Zredukuj na limit kategórie.");
+    const riskLim = p.cat === "long" ? s.riskTrancheLong : s.riskTrancheSwing;
+    if (r.riskPct > riskLim * 1.6) add("warn", p.ticker, `Riziko k SL ${(r.riskPct * 100).toFixed(2)} % NLV (limit na tranžu ${(riskLim * 100).toFixed(1)} %)`, "Posuň SL bližšie / zmenši pozíciu (pozícia z viacerých tranží môže byť vyššie, ale strop stráž).");
+    if (p.sl && r.price != null) {
+      if (r.price <= p.sl) add("bad", p.ticker, `Cena ${f2(r.price)} ≤ SL ${f2(p.sl)}`, p.cat === "long" ? "Mäkký SL: rozhoduje týždenná sviečka + téza — over a konaj podľa plánu." : "Tvrdý SL zasiahnutý — výstup, žiadne posúvanie nadol.");
+      else if ((r.price - p.sl) / r.price < 0.03) add("warn", p.ticker, `Cena ${f2(r.price)} < 3 % od SL ${f2(p.sl)}`, "Priprav exekúciu, nerozhoduj v emócii po zatvorení.");
+    }
+    if (p.tp1 && r.price != null && r.price >= p.tp1) add("ok", p.ticker, `TP1 ${f2(p.tp1)} dosiahnutý (cena ${f2(r.price)})`, p.cat === "spec" ? "Realizuj 1/2, zvyšok trailing/časový stop." : p.cat === "swing" ? "Realizuj 1/2 na +2R, SL na break-even." : "Zváž redukciu 1/4 do sily, zvyšok nechaj bežať.");
+    if (r.pnlPct != null) {
+      if (p.cat === "long" && r.pnlPct >= (s.longBePct || 30) && p.sl < p.avg) add("ok", p.ticker, `+${r.pnlPct.toFixed(0)} % — long swing nad +${s.longBePct || 30} %`, "Presuň SL minimálne na break-even (kap. 3.1).");
+      if (p.cat === "swing" && p.sl && r.price != null) {
+        const r1 = p.avg + (p.avg - p.sl);
+        if (r.price >= r1 && p.sl < p.avg) add("ok", p.ticker, "Swing dosiahol +1R", "SL na break-even (kap. 3.2).");
+      }
+    }
+    // časové stopy
+    if (p.date && cr.timeStopDays > 0) {
+      const days = (Date.now() - new Date(p.date).getTime()) / 86400000;
+      if (p.cat === "swing" && days > cr.timeStopDays && r.pnlPct != null && Math.abs(r.pnlPct) < 3) add("warn", p.ticker, `Swing ${Math.round(days)} dní bez pohybu (±0)`, `Časový stop ${cr.timeStopDays} dní — zavri, kapitál má pracovať.`);
+      if (p.cat === "spec" && days > cr.timeStopDays) add("warn", p.ticker, `Špekulácia beží ${Math.round(days)} dní`, `Časový stop ${cr.timeStopDays} dní — uzavri alebo zdôvodni v denníku.`);
+    }
+    // technika
+    const m = r.m;
+    if (m) {
+      if (m.rsi14 != null && m.rsi14 > 78) add("info", p.ticker, `RSI ${m.rsi14.toFixed(0)} — eufória`, p.cat === "long" ? "Zóna na redukciu do sily, nie na dokup." : "Zvaž realizáciu časti zisku.");
+      if (m.rsi14 != null && m.rsi14 < 30) add("info", p.ticker, `RSI ${m.rsi14.toFixed(0)} — prepredané`, "Dokup len ak je to A-kategória s platnou tézou (kap. 2.2).");
+      if (m.sma200 && m.price < m.sma200 && p.cat === "long") add("warn", p.ticker, "Cena pod 200d MA", "Tézový/technický stop pre long swing — over týždenný graf (kap. 3.1).");
+      if (m.sma50 && m.price < m.sma50 && p.cat === "swing") add("info", p.ticker, "Cena pod 50d MA", "Setup slabne — skontroluj swing low / SL.");
+      if (m.gapPct != null && Math.abs(m.gapPct) >= 3) add(m.gapPct < 0 ? "warn" : "info", p.ticker, `Gap ${fp(m.gapPct)} na otvorení`, "Over správy/earnings — gap býva katalyzátor aj varovanie.");
+      if (m.volRatio != null && m.volRatio >= 2 && Math.abs(m.changePct) >= 2) add("info", p.ticker, `Objem ${m.volRatio.toFixed(1)}× priemer pri ${fp(m.changePct)}`, "Inštitucionálna aktivita — pozri news/insider/analyst zmeny.");
+    }
+  });
+
+  // Watchlist proximita
+  state.watchlist.forEach(w => {
+    const m = derived.mkt.tickers[w.ticker];
+    if (w.level === "A" && m && w.zoneLow && w.zoneHigh && m.price >= +w.zoneLow && m.price <= +w.zoneHigh) {
+      add("ok", w.ticker + " (WL)", `Cena ${f2(m.price)} vo vstupnej zóne ${w.zoneLow}–${w.zoneHigh}`, "Kandidát na vstup — over 5 otázok z kap. 2.1 a kapacitu (páka, počet, téma).");
+    }
+  });
+
+  const order = { bad: 0, warn: 1, ok: 2, info: 3 };
+  return A.sort((a, b) => order[a.sev] - order[b.sev]);
+}
+
+/* ---------------- import parser ---------------- */
+function parseImport(text) {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (!lines.length) return [];
+  const delim = lines[0].includes("\t") ? "\t" : lines[0].includes(";") ? ";" : ",";
+  const rows = lines.map(l => l.split(delim).map(c => c.replace(/^"|"$/g, "").trim()));
+  const head = rows[0].map(h => h.toLowerCase());
+  const idx = (...keys) => head.findIndex(h => keys.some(k => h.includes(k)));
+  let iT = idx("symbol", "ticker", "fin"), iQ = idx("quantity", "position", "ks", "množ", "mnoz", "qty"),
+    iA = idx("cost", "avg", "priem"), iP = idx("last", "mark", "price", "cena", "akt");
+  let data = rows.slice(1);
+  if (iT < 0) { iT = 0; iQ = 1; iA = 2; iP = 3; data = rows; } // bez hlavičky
+  const num = (s) => { const n = parseFloat(String(s).replace(/\s/g, "").replace(",", ".")); return isNaN(n) ? null : n; };
+  return data.map((r, i) => {
+    const t = (r[iT] || "").toUpperCase().replace(/[^A-Z0-9.\-]/g, "");
+    if (!t || t === "TOTAL") return null;
+    return { id: "imp" + Date.now() + i, ticker: t, cat: "swing", theme: "Iné", thesis: "", date: new Date().toISOString().slice(0, 10), qty: num(r[iQ]) || 0, avg: num(r[iA]) || 0, manualPrice: num(r[iP]) || num(r[iA]) || 0, sl: "", tp1: "", note: "import — doplň kategóriu, tézu, SL" };
+  }).filter(Boolean);
+}
+
+/* ---------------- cloud sync (IBKR Flex → Apps Script → JSON) ---------------- */
+function mergeCloudPositions(existing, cloudRows) {
+  // cloudRows: [{ticker, qty, avg, price}] — zachová kategóriu, tému, tézu, SL, TP existujúcich pozícií
+  const byT = Object.fromEntries(existing.map(p => [p.ticker.toUpperCase(), p]));
+  const seen = new Set();
+  const merged = cloudRows.map((r, i) => {
+    const t = String(r.ticker || r.symbol || "").toUpperCase().trim();
+    if (!t) return null;
+    seen.add(t);
+    const old = byT[t];
+    const qty = +r.qty || +r.position || 0;
+    const avg = +r.avg || +r.costBasisPrice || +r.cost || 0;
+    const price = +r.price || +r.markPrice || avg;
+    if (old) return { ...old, qty, avg: avg || old.avg, manualPrice: price || old.manualPrice };
+    return { id: "cl" + Date.now() + i, ticker: t, cat: "swing", theme: "Iné", thesis: "", date: new Date().toISOString().slice(0, 10), qty, avg, manualPrice: price, sl: "", tp1: "", note: "cloud sync — doplň kategóriu, tézu, SL" };
+  }).filter(Boolean);
+  const closed = existing.filter(p => !seen.has(p.ticker.toUpperCase()));
+  return { merged, closedTickers: closed.map(p => p.ticker) };
+}
+
+/* ============================================================ */
+function App() {
+  const [state, setState] = useState({ settings: DEFAULT_SETTINGS, positions: DEFAULT_POSITIONS, watchlist: DEFAULT_WATCHLIST, journal: [] });
+  const [market, setMarket] = useState({ tickers: {}, spy: null });
+  const [tab, setTab] = useState("dash");
+  const [loaded, setLoaded] = useState(false);
+  const [fetchStatus, setFetchStatus] = useState("");
+  const [ai, setAi] = useState({ busy: false, title: "", text: "", err: "" });
+  const [cloud, setCloud] = useState({ busy: false, msg: "", closed: [] });
+  const [scout, setScout] = useState({ busy: false, text: "", cands: [], err: "" });
+  const [impTxt, setImpTxt] = useState("");
+  const [impMode, setImpMode] = useState("replace");
+  const emptyJr = { date: new Date().toISOString().slice(0, 10), ticker: "", cat: "swing", action: "Nákup", qty: "", price: "", reason: "", riskPlan: "", result: "", resultR: "", emotion: "", rules: "Áno", lesson: "" };
+  const [jr, setJr] = useState(emptyJr);
+  const saveTimer = useRef(null);
+
+  /* ---------- synchronizácia stavu medzi zariadeniami ---------- */
+  const stateRef = useRef(state);
+  useEffect(() => { stateRef.current = state; }, [state]);
+  const savedAtRef = useRef("");
+  const pushTimer = useRef(null);
+  const [syncMsg, setSyncMsg] = useState("");
+  const stateUrl = (u) => u.trim() + (u.includes("?") ? "&" : "?") + "state=1";
+
+  const pushState = useCallback(async (manual) => {
+    const st = stateRef.current;
+    const u = st.settings.cloudUrl?.trim();
+    if (!u || (!st.settings.stateSync && !manual)) return;
+    try {
+      const savedAt = new Date().toISOString();
+      const payload = { settings: st.settings, positions: st.positions, watchlist: st.watchlist, journal: st.journal, savedAt };
+      const r = await fetch(stateUrl(u), { method: "POST", body: JSON.stringify(payload) });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error || "neočakávaná odpoveď");
+      savedAtRef.current = savedAt;
+      setSyncMsg(`Stav uložený do cloudu ${new Date().toLocaleTimeString("sk-SK")} ✓`);
+    } catch (e) {
+      if (manual) setSyncMsg(`Uloženie stavu zlyhalo: ${e.message}${/Failed to fetch/i.test(e.message) ? " (v Claude sandboxe sync nefunguje — funguje na webe/mobile/stiahnutej verzii)" : ""}`);
+    }
+  }, []);
+
+  const pullState = useCallback(async (manual) => {
+    const u = stateRef.current.settings.cloudUrl?.trim();
+    if (!u) { if (manual) setSyncMsg("Zadaj URL cloud endpointu."); return; }
+    try {
+      const r = await fetch(stateUrl(u));
+      const j = await r.json();
+      if (j.error) throw new Error(j.error);
+      if (j.empty || !j.positions) { if (manual) setSyncMsg("V cloude zatiaľ nie je uložený žiadny stav — ulož ho z tohto zariadenia."); return; }
+      if (!manual && j.savedAt && savedAtRef.current && j.savedAt <= savedAtRef.current) return; // lokálny je novší
+      setState(st => ({
+        settings: { ...DEFAULT_SETTINGS, ...j.settings, catRules: { long: catRule(j.settings || {}, "long"), swing: catRule(j.settings || {}, "swing"), spec: catRule(j.settings || {}, "spec") } },
+        positions: j.positions, watchlist: j.watchlist || st.watchlist, journal: j.journal || st.journal,
+      }));
+      savedAtRef.current = j.savedAt || new Date().toISOString();
+      setSyncMsg(`Stav načítaný z cloudu (uložený ${j.savedAt ? new Date(j.savedAt).toLocaleString("sk-SK") : "?"}) ✓`);
+    } catch (e) {
+      if (manual) setSyncMsg(`Načítanie stavu zlyhalo: ${e.message}${/Failed to fetch/i.test(e.message) ? " (v Claude sandboxe sync nefunguje — funguje na webe/mobile/stiahnutej verzii)" : ""}`);
+    }
+  }, []);
+
+  const fetchCloud = useCallback(async (url) => {
+    const u = (url ?? state.settings.cloudUrl).trim();
+    if (!u) { setCloud(c => ({ ...c, msg: "Zadaj URL cloud endpointu v Nastaveniach." })); return; }
+    setCloud({ busy: true, msg: "Sťahujem dáta z cloudu…", closed: [] });
+    try {
+      const r = await fetch(u, { redirect: "follow" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      const rows = Array.isArray(j) ? j : j.positions || [];
+      if (!rows.length) throw new Error("Endpoint nevrátil žiadne pozície (skontroluj Flex Query a skript).");
+      setState(st => {
+        const { merged, closedTickers } = mergeCloudPositions(st.positions, rows);
+        setCloud({ busy: false, msg: `Synchronizované ${merged.length} pozícií${j.generated ? ` (dáta IBKR: ${j.generated})` : ""} o ${new Date().toLocaleTimeString("sk-SK")}.`, closed: closedTickers });
+        const settings = { ...st.settings };
+        if (j.nlv) settings.nlv = Math.round(+j.nlv);
+        if (j.excessLiq) settings.excessLiq = Math.round(+j.excessLiq);
+        return { ...st, settings, positions: merged };
+      });
+    } catch (e) {
+      setCloud({ busy: false, msg: `Cloud sync zlyhal: ${e.message}. Ak ti URL v prehliadači ukazuje JSON, sandbox appky blokuje pripojenie — použi vloženie JSON v paneli Import nižšie (funguje vždy).`, closed: [] });
+    }
+  }, [state.settings.cloudUrl]);
+
+  /* auto cloud sync pri otvorení */
+  const cloudOnce = useRef(false);
+  useEffect(() => {
+    if (loaded && state.settings.cloudAuto && state.settings.cloudUrl && !cloudOnce.current) {
+      cloudOnce.current = true;
+      fetchCloud(state.settings.cloudUrl);
+    }
+  }, [loaded, state.settings.cloudAuto, state.settings.cloudUrl, fetchCloud]);
+
+
+  /* persist */
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await window.storage.get("swing-ptf-v1");
+        if (r?.value) {
+          const v = JSON.parse(r.value);
+          setState(s => ({
+            settings: { ...DEFAULT_SETTINGS, ...v.settings, catRules: { long: catRule(v.settings || {}, "long"), swing: catRule(v.settings || {}, "swing"), spec: catRule(v.settings || {}, "spec") } },
+            positions: v.positions || s.positions, watchlist: v.watchlist || s.watchlist, journal: v.journal || [],
+          }));
+          if (v.market) setMarket(v.market);
+          if (v.savedAt) savedAtRef.current = v.savedAt;
+        }
+      } catch (e) { /* prvé spustenie */ }
+      setLoaded(true);
+    })();
+  }, []);
+  /* auto-pull stavu z cloudu pri otvorení */
+  const pullOnce = useRef(false);
+  useEffect(() => {
+    if (loaded && state.settings.stateSync && state.settings.cloudUrl && !pullOnce.current) {
+      pullOnce.current = true;
+      pullState(false);
+    }
+  }, [loaded, state.settings.stateSync, state.settings.cloudUrl, pullState]);
+  useEffect(() => {
+    if (!loaded) return;
+    clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      const savedAt = new Date().toISOString();
+      try { await window.storage.set("swing-ptf-v1", JSON.stringify({ ...state, market, savedAt })); } catch (e) { console.error(e); }
+    }, 800);
+    clearTimeout(pushTimer.current);
+    pushTimer.current = setTimeout(() => pushState(false), 4000);
+  }, [state, market, loaded, pushState]);
+
+  const setSettings = (patch) => setState(s => ({ ...s, settings: { ...s.settings, ...patch } }));
+
+  /* trhové dáta */
+  const fetchAll = useCallback(async (force = false) => {
+    const key = state.settings.tdKey.trim();
+    if (!key) { setFetchStatus("Bez API kľúča — používam manuálne ceny. Kľúč zadáš v Nastaveniach."); return; }
+    const tickers = [...new Set([...state.positions.map(p => p.ticker), ...state.watchlist.filter(w => w.level === "A").map(w => w.ticker), "SPY"])];
+    const fresh = (t) => market.tickers[t] && Date.now() - market.tickers[t].ts < 10 * 60000;
+    const todo = tickers.filter(t => force || !fresh(t) || (t === "SPY" && !market.spy));
+    if (!todo.length) { setFetchStatus("Dáta sú čerstvé (<10 min)."); return; }
+    let done = 0;
+    for (const t of todo) {
+      setFetchStatus(`Načítavam ${t}… (${done + 1}/${todo.length}; free limit ≈ 8/min)`);
+      try {
+        const r = await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(t)}&interval=1day&outputsize=250&apikey=${encodeURIComponent(key)}`);
+        const j = await r.json();
+        if (j.status === "error") throw new Error(j.message);
+        const ind = computeIndicators(j.values || []);
+        if (ind) {
+          setMarket(m => {
+            const nt = { ...m.tickers, [t]: ind };
+            const spy = t === "SPY" ? { ...ind, hiAll: Math.max(...(j.values || []).map(v => +v.close)) } : m.spy;
+            return { tickers: nt, spy };
+          });
+        }
+      } catch (e) {
+        if (/Failed to fetch|NetworkError|load failed/i.test(e.message)) {
+          setFetchStatus("Pripojenie na Twelve Data je v tomto prostredí zablokované (sandbox Claude). Stiahni si HTML verziu appky a otvor ju v prehliadači — tam trhové dáta fungujú naplno.");
+          return;
+        }
+        setFetchStatus(`${t}: ${e.message}. Pokračujem…`);
+        if (/credits|limit/i.test(e.message)) await new Promise(res => setTimeout(res, 60000));
+      }
+      done++;
+      if (done < todo.length) await new Promise(res => setTimeout(res, 8200));
+    }
+    setFetchStatus(`Hotovo — ${done} tickerov aktualizovaných ${new Date().toLocaleTimeString("sk-SK")}.`);
+  }, [state, market]);
+
+  /* auto-refresh */
+  useEffect(() => {
+    const min = +state.settings.autoRefreshMin;
+    if (!min) return;
+    const id = setInterval(() => fetchAll(false), min * 60000);
+    return () => clearInterval(id);
+  }, [state.settings.autoRefreshMin, fetchAll]);
+
+  /* odvodené hodnoty */
+  const derived = useMemo(() => {
+    const s = state.settings;
+    const rows = state.positions.map(p => {
+      const m = market.tickers[p.ticker];
+      const price = m?.price ?? (p.manualPrice || null);
+      const value = price != null ? price * p.qty : 0;
+      const pnl = price != null && p.avg ? (price - p.avg) * p.qty : null;
+      const pnlPct = price != null && p.avg ? (price / p.avg - 1) * 100 : null;
+      const risk = p.sl && price != null ? Math.max(0, (price - p.sl) * p.qty) : null;
+      return { p, m, price, value, pnl, pnlPct, risk, pctNlv: s.nlv ? value / s.nlv : 0, riskPct: risk != null && s.nlv ? risk / s.nlv : 0 };
+    });
+    const totals = {
+      value: rows.reduce((a, r) => a + r.value, 0),
+      pnl: rows.reduce((a, r) => a + (r.pnl || 0), 0),
+      risk: rows.reduce((a, r) => a + (r.risk || 0), 0),
+    };
+    totals.lev = s.nlv ? totals.value / s.nlv : 0;
+    totals.riskPct = s.nlv ? totals.risk / s.nlv : 0;
+    const themes = THEMES.map(name => {
+      const v = rows.filter(r => r.p.theme === name).reduce((a, r) => a + r.value, 0);
+      return { name, value: v, pct: s.nlv ? v / s.nlv : 0 };
+    }).filter(t => t.value > 0 || true);
+    const byCat = {};
+    Object.keys(CATS).forEach(k => {
+      const rs = rows.filter(r => r.p.cat === k);
+      byCat[k] = { count: rs.length, value: rs.reduce((a, r) => a + r.value, 0) };
+    });
+    const d = { rows, totals, themes, byCat, mkt: { ...market, spy: market.spy } };
+    d.alerts = buildAlerts(state, d);
+    return d;
+  }, [state, market]);
+
+  /* AI analytik */
+  const runAI = async (title, prompt) => {
+    setAi({ busy: true, title, text: "", err: "" });
+    try { const text = await askClaude(prompt, true); setAi({ busy: false, title, text, err: "" }); setTab("ai"); }
+    catch (e) { setAi({ busy: false, title, text: "", err: e.message }); setTab("ai"); }
+  };
+  const analyzeTicker = (r) => {
+    const m = r.m;
+    runAI(`Analýza ${r.p.ticker}`, `${STRATEGY_BRIEF}
+
+Pozícia: ${r.p.ticker}, kategória ${CATS[r.p.cat].label}, téma ${r.p.theme}.
+Téza: ${r.p.thesis || "(nezapísaná)"}. Vstup ${r.p.date}, ${r.p.qty} ks @ ${r.p.avg}, aktuálna cena ${r.price ?? "?"}, SL ${r.p.sl || "?"}, TP1 ${r.p.tp1 || "?"}, P&L ${r.pnlPct?.toFixed(1) ?? "?"} %.
+${m ? `Technika: RSI14 ${m.rsi14?.toFixed(0)}, SMA50 ${f2(m.sma50)}, SMA200 ${f2(m.sma200)}, ATR ${m.atrPct?.toFixed(1)} %/deň, objem ${m.volRatio?.toFixed(1)}× priemer, gap dnes ${m.gapPct?.toFixed(1)} %.` : ""}
+
+Vyhľadaj na webe a stručne zhrň po slovensky (vlastnými slovami, žiadne dlhé citácie):
+1. Najdôležitejšie správy k ${r.p.ticker} za posledných 7 dní.
+2. Najbližší dátum earnings a posledná guidance / jej zmeny.
+3. Významné insider transakcie za posledný mesiac.
+4. Zmeny ratingov / cieľových cien analytikov za posledné 2 týždne.
+5. VERDIKT podľa pravidiel vyššie: platí téza? hrozí porušenie pravidla (SL, veľkosť, časový stop, earnings risk)? Konkrétna akcia: držať / redukovať / dotiahnuť SL / zavrieť — s 1–2 vetami zdôvodnenia. Nejde o investičné poradenstvo, ale o kontrolu disciplíny voči vlastným pravidlám používateľa.
+Formátuj nadpismi (##) a odrážkami, max ~350 slov.`);
+  };
+  const dailyReport = () => {
+    const pos = derived.rows.map(r => `${r.p.ticker} [${CATS[r.p.cat].short}] ${r.p.qty}ks@${r.p.avg}, cena ${r.price}, P&L ${r.pnlPct?.toFixed(1)}%, SL ${r.p.sl}, TP1 ${r.p.tp1}, téma ${r.p.theme}${r.m ? `, RSI ${r.m.rsi14?.toFixed(0)}, vs SMA50 ${r.m.sma50 ? fp((r.price / r.m.sma50 - 1) * 100) : "?"}` : ""}`).join("\n");
+    const al = derived.alerts.slice(0, 12).map(a => `[${a.sev.toUpperCase()}] ${a.scope}: ${a.msg}`).join("\n");
+    const wl = state.watchlist.filter(w => w.level === "A").map(w => `${w.ticker}: zóna ${w.zoneLow}–${w.zoneHigh}, katalyzátor ${w.catalyst}`).join("\n");
+    runAI("Denný report", `${STRATEGY_BRIEF}
+
+Stav účtu: NLV ${state.settings.nlv} €, pozície ${f0(derived.totals.value)} €, páka ${derived.totals.lev.toFixed(2)}×, Excess Liq ${state.settings.excessLiq} €, otvorené riziko ${(derived.totals.riskPct * 100).toFixed(1)} % NLV.
+Pozície:
+${pos}
+Aktívne upozornenia engine-u:
+${al || "žiadne"}
+A-watchlist:
+${wl || "prázdny"}
+
+Vyhľadaj na webe dnešný stav trhu (SPY/QQQ trend, VIX, 10Y výnos, dnešné/zajtrajšie makro udalosti — CPI/PCE/NFP/FOMC, earnings mojich tickerov tento a budúci týždeň) a napíš po slovensky DENNÝ REPORT:
+## Režim trhu (risk-on/neutral/risk-off + 2 vety prečo)
+## Kalendár rizík (najbližšie makro + earnings mojich pozícií s dátumami)
+## Portfólio vs pravidlá (3–5 najdôležitejších bodov z upozornení, s konkrétnou akciou)
+## Kandidáti na vstup (z A-watchlistu — len ak setup a režim trhu dovoľujú; inak povedz prečo nie)
+## 3 vety na dnes (čo urobím / čoho sa zdržím)
+Vecne, max ~400 slov, vlastnými slovami. Toto je kontrola disciplíny, nie investičné poradenstvo.`);
+  };
+
+  /* ---------- UI primitívy ---------- */
+  const Panel = ({ title, right, children, style }) => (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 14, ...style }}>
+      {(title || right) && <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+        <div style={{ fontSize: 11, letterSpacing: ".12em", color: C.mut, textTransform: "uppercase", fontWeight: 600 }}>{title}</div>
+        <div>{right}</div>
+      </div>}
+      {children}
+    </div>
+  );
+  const Btn = ({ children, onClick, kind = "ghost", small, disabled }) => (
+    <button onClick={onClick} disabled={disabled} style={{
+      background: kind === "primary" ? C.amber : "transparent",
+      color: kind === "primary" ? "#1A1408" : kind === "danger" ? C.bad : C.text,
+      border: `1px solid ${kind === "primary" ? C.amber : kind === "danger" ? C.bad : C.line}`,
+      borderRadius: 7, padding: small ? "4px 10px" : "7px 14px", fontSize: small ? 12 : 13,
+      fontWeight: 600, cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.5 : 1, fontFamily: SANS,
+    }}>{children}</button>
+  );
+  const Input = ({ mono, w, style, ...rest }) => (
+    <input {...rest} style={{ background: C.bg, border: `1px solid ${C.line}`, color: C.text, borderRadius: 6, padding: "6px 8px", fontSize: 13, fontFamily: mono ? MONO : SANS, width: w || "100%", boxSizing: "border-box", ...style }} />
+  );
+  const Sel = ({ value, onChange, options }) => (
+    <select value={value} onChange={onChange} style={{ background: C.bg, border: `1px solid ${C.line}`, color: C.text, borderRadius: 6, padding: "6px 8px", fontSize: 13, width: "100%" }}>
+      {options.map(o => <option key={o.v} value={o.v}>{o.l}</option>)}
+    </select>
+  );
+  const Light = ({ ok, warn, label, value }) => {
+    const col = ok ? C.ok : warn ? C.warn : C.bad;
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 12px", borderRight: `1px solid ${C.line}` }}>
+        <span style={{ width: 9, height: 9, borderRadius: "50%", background: col, boxShadow: `0 0 8px ${col}88`, flexShrink: 0 }} />
+        <div>
+          <div style={{ fontSize: 10, color: C.dim, letterSpacing: ".08em", textTransform: "uppercase" }}>{label}</div>
+          <div style={{ fontSize: 12.5, fontFamily: MONO, color: C.text }}>{value}</div>
+        </div>
+      </div>
+    );
+  };
+
+  /* ---------- záložky ---------- */
+  const s = state.settings, T = derived.totals;
+  const spy = market.spy;
+  const spyTrendOk = spy?.sma50 ? spy.price >= spy.sma50 : null;
+
+  const Dashboard = () => (
+    <div style={{ display: "grid", gap: 14 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14 }}>
+        {[
+          { l: "NLV", v: `${f0(s.nlv)} €` },
+          { l: "Hodnota pozícií", v: `${f0(T.value)} €` },
+          { l: "Páka", v: `${T.lev.toFixed(2)}×`, c: T.lev > s.maxLevNormal ? C.bad : C.ok },
+          { l: "Nereal. P&L", v: `${T.pnl >= 0 ? "+" : ""}${f0(T.pnl)} €`, c: T.pnl >= 0 ? C.ok : C.bad },
+          { l: "Otvorené riziko", v: `${(T.riskPct * 100).toFixed(1)} % NLV`, c: T.riskPct > 0.08 ? C.warn : C.ok },
+          { l: "Excess Liquidity", v: `${f0(s.excessLiq)} €`, c: s.excessLiq < s.minExcessPct * s.nlv ? C.bad : C.ok },
+        ].map((k, i) => (
+          <Panel key={i}><div style={{ fontSize: 10.5, color: C.dim, letterSpacing: ".1em", textTransform: "uppercase", marginBottom: 6 }}>{k.l}</div>
+            <div style={{ fontSize: 22, fontFamily: MONO, fontWeight: 600, color: k.c || C.text }}>{k.v}</div></Panel>
+        ))}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <Panel title="Expozícia podľa tém (limit 40 % NLV)">
+          {derived.themes.map(t => {
+            const over = t.pct > s.maxThemePct;
+            return (
+              <div key={t.name} style={{ margin: "7px 0" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 3 }}>
+                  <span style={{ color: C.text }}>{t.name}</span>
+                  <span style={{ fontFamily: MONO, color: over ? C.bad : C.mut }}>{f0(t.value)} € · {(t.pct * 100).toFixed(1)} %</span>
+                </div>
+                <div style={{ height: 5, background: C.bg, borderRadius: 3, overflow: "hidden" }}>
+                  <div style={{ width: `${Math.min(100, t.pct / s.maxThemePct * 100)}%`, height: "100%", background: over ? C.bad : t.pct > s.maxThemePct * 0.8 ? C.warn : C.info, borderRadius: 3 }} />
+                </div>
+              </div>
+            );
+          })}
+        </Panel>
+        <div style={{ display: "grid", gap: 14 }}>
+          <Panel title="Kategórie">
+            {Object.entries(CATS).map(([k, c]) => (
+              <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: `1px solid ${C.line}`, fontSize: 13 }}>
+                <span style={{ color: c.color, fontWeight: 600 }}>{c.label}</span>
+                <span style={{ fontFamily: MONO, color: derived.byCat[k].count > catRule(s, k).maxCount ? C.bad : C.text }}>
+                  {derived.byCat[k].count}/{catRule(s, k).maxCount} poz. · {f0(derived.byCat[k].value)} € · {s.nlv ? (derived.byCat[k].value / s.nlv * 100).toFixed(1) : 0} %
+                </span>
+              </div>
+            ))}
+          </Panel>
+          <Panel title="Stres test −20 %">
+            {(() => {
+              const loss = T.value * 0.2, nlv2 = s.nlv - loss, lev2 = nlv2 > 0 ? T.value * 0.8 / nlv2 : Infinity;
+              const el2 = s.excessLiq - loss * 0.6; // konzervatívny odhad poklesu EL
+              const okk = lev2 < 2 && el2 > 0;
+              return <div style={{ fontSize: 13, fontFamily: MONO, lineHeight: 1.8 }}>
+                NLV po prepade: <span style={{ color: C.text }}>{f0(nlv2)} €</span><br />
+                Páka po prepade: <span style={{ color: lev2 > 2 ? C.bad : C.ok }}>{isFinite(lev2) ? lev2.toFixed(2) : "∞"}×</span><br />
+                <span style={{ color: okk ? C.ok : C.bad, fontFamily: SANS, fontSize: 12 }}>{okk ? "Prežiteľné podľa kap. 4." : "Páka je privysoká už dnes (kap. 4) — redukuj."}</span>
+              </div>;
+            })()}
+          </Panel>
+        </div>
+      </div>
+
+      <Panel title={`Upozornenia (${derived.alerts.length})`} right={<Btn small onClick={() => setTab("alerts")}>Všetky →</Btn>}>
+        {derived.alerts.length === 0 && <div style={{ color: C.ok, fontSize: 13 }}>Žiadne porušenia pravidiel. Disciplína drží.</div>}
+        {derived.alerts.slice(0, 6).map((a, i) => (
+          <div key={i} style={{ display: "flex", gap: 10, padding: "7px 0", borderBottom: `1px solid ${C.line}`, fontSize: 13 }}>
+            <span style={{ color: sevColor(a.sev), fontFamily: MONO, fontSize: 11, fontWeight: 700, minWidth: 70 }}>{a.scope}</span>
+            <span style={{ color: C.text }}>{a.msg}</span>
+          </div>
+        ))}
+      </Panel>
+    </div>
+  );
+
+  const updatePos = (id, patch) => setState(st => ({ ...st, positions: st.positions.map(p => p.id === id ? { ...p, ...patch } : p) }));
+  const [editId, setEditId] = useState(null);
+
+  const Positions = () => (
+    <div style={{ display: "grid", gap: 14 }}>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+        <Btn kind="primary" onClick={() => fetchAll(true)}>↻ Obnoviť trhové dáta</Btn>
+        <Btn onClick={() => { const np = { id: "p" + Date.now(), ticker: "NOVÝ", cat: "swing", theme: "Iné", thesis: "", date: new Date().toISOString().slice(0, 10), qty: 0, avg: 0, manualPrice: 0, sl: "", tp1: "", note: "" }; setState(st => ({ ...st, positions: [...st.positions, np] })); setEditId(np.id); }}>+ Pridať pozíciu</Btn>
+        {fetchStatus && <span style={{ fontSize: 12, color: C.mut }}>{fetchStatus}</span>}
+      </div>
+      <div style={{ overflowX: "auto", background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10 }}>
+        <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 12.5, minWidth: 1100 }}>
+          <thead>
+            <tr>{["Ticker", "Kat.", "Ks", "Priem.", "Cena", "Hodnota", "% NLV", "P&L %", "SL", "Vzd. SL", "TP1", "RSI", "vs 50d", "vs 200d", "ATR/d", "Obj.×", ""].map(h => (
+              <th key={h} style={{ textAlign: "right", padding: "9px 8px", color: C.dim, fontSize: 10.5, letterSpacing: ".07em", textTransform: "uppercase", borderBottom: `1px solid ${C.line}`, fontWeight: 600, whiteSpace: "nowrap" }}>{h}</th>
+            ))}</tr>
+          </thead>
+          <tbody>
+            {derived.rows.map(r => {
+              const p = r.p, m = r.m;
+              const distSL = p.sl && r.price ? (p.sl / r.price - 1) * 100 : null;
+              const slDanger = distSL != null && distSL > -3;
+              return (
+                <React.Fragment key={p.id}>
+                  <tr style={{ borderBottom: `1px solid ${C.line}` }}>
+                    <td style={{ padding: "8px", textAlign: "left", fontFamily: MONO, fontWeight: 700 }}>
+                      <span style={{ color: C.text }}>{p.ticker}</span>
+                      <div style={{ fontSize: 10, color: C.dim, fontFamily: SANS, maxWidth: 160, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{p.thesis || "⚠ bez tézy"}</div>
+                    </td>
+                    <td style={{ padding: 8, textAlign: "right" }}><span style={{ color: CATS[p.cat].color, fontSize: 10.5, fontFamily: MONO, fontWeight: 700 }}>{CATS[p.cat].short}</span></td>
+                    <td style={tdN}>{p.qty}</td>
+                    <td style={tdN}>{f2(p.avg)}</td>
+                    <td style={{ ...tdN, color: C.text, fontWeight: 600 }}>{f2(r.price)}{!m && <span title="manuálna cena" style={{ color: C.dim }}>*</span>}</td>
+                    <td style={tdN}>{f0(r.value)}</td>
+                    <td style={{ ...tdN, color: r.pctNlv > catRule(s, p.cat).maxPct ? C.bad : C.mut }}>{(r.pctNlv * 100).toFixed(1)}</td>
+                    <td style={{ ...tdN, color: r.pnlPct >= 0 ? C.ok : C.bad }}>{fp(r.pnlPct)}</td>
+                    <td style={{ ...tdN, color: p.sl ? C.mut : C.bad }}>{p.sl ? f2(p.sl) : "CHÝBA"}</td>
+                    <td style={{ ...tdN, color: slDanger ? C.bad : C.mut }}>{distSL != null ? `${distSL.toFixed(1)} %` : "—"}</td>
+                    <td style={tdN}>{p.tp1 ? f2(p.tp1) : "—"}</td>
+                    <td style={{ ...tdN, color: m?.rsi14 > 78 ? C.warn : m?.rsi14 < 30 ? C.info : C.mut }}>{m?.rsi14?.toFixed(0) ?? "—"}</td>
+                    <td style={{ ...tdN, color: m?.sma50 ? (m.price >= m.sma50 ? C.ok : C.warn) : C.dim }}>{m?.sma50 ? fp((m.price / m.sma50 - 1) * 100) : "—"}</td>
+                    <td style={{ ...tdN, color: m?.sma200 ? (m.price >= m.sma200 ? C.ok : C.bad) : C.dim }}>{m?.sma200 ? fp((m.price / m.sma200 - 1) * 100) : "—"}</td>
+                    <td style={tdN}>{m?.atrPct ? fpn(m.atrPct) : "—"}</td>
+                    <td style={{ ...tdN, color: m?.volRatio >= 2 ? C.warn : C.mut }}>{m?.volRatio ? m.volRatio.toFixed(1) : "—"}</td>
+                    <td style={{ padding: 8, textAlign: "right", whiteSpace: "nowrap" }}>
+                      <Btn small onClick={() => analyzeTicker(r)}>AI</Btn>{" "}
+                      <Btn small onClick={() => setEditId(editId === p.id ? null : p.id)}>{editId === p.id ? "Zavrieť" : "Upraviť"}</Btn>
+                    </td>
+                  </tr>
+                  {editId === p.id && (
+                    <tr><td colSpan={17} style={{ padding: 12, background: C.panel2 }}>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10 }}>
+                        {[["Ticker", "ticker"], ["Ks", "qty"], ["Priem. cena", "avg"], ["Cena (manuál)", "manualPrice"], ["SL", "sl"], ["TP1", "tp1"], ["Dátum 1. vstupu", "date"]].map(([l, k]) => (
+                          <label key={k} style={{ fontSize: 11, color: C.mut }}>{l}
+                            <Input mono value={p[k] ?? ""} onChange={e => updatePos(p.id, { [k]: ["ticker", "date"].includes(k) ? e.target.value.toUpperCase() : (k === "date" ? e.target.value : e.target.value === "" ? "" : +e.target.value || e.target.value) })} />
+                          </label>
+                        ))}
+                        <label style={{ fontSize: 11, color: C.mut }}>Kategória
+                          <Sel value={p.cat} onChange={e => updatePos(p.id, { cat: e.target.value })} options={Object.entries(CATS).map(([v, c]) => ({ v, l: c.label }))} />
+                        </label>
+                        <label style={{ fontSize: 11, color: C.mut }}>Téma
+                          <Sel value={p.theme} onChange={e => updatePos(p.id, { theme: e.target.value })} options={THEMES.map(t => ({ v: t, l: t }))} />
+                        </label>
+                      </div>
+                      <label style={{ fontSize: 11, color: C.mut, display: "block", marginTop: 10 }}>Téza jednou vetou („vlastním X, lebo Y, držím kým platí Z")
+                        <Input value={p.thesis} onChange={e => updatePos(p.id, { thesis: e.target.value })} />
+                      </label>
+                      <div style={{ marginTop: 10, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <span style={{ fontSize: 11, color: C.dim }}>SL pravidlo kategórie: {CATS[p.cat].slHint}</span>
+                        <Btn small kind="danger" onClick={() => { setState(st => ({ ...st, positions: st.positions.filter(x => x.id !== p.id) })); setEditId(null); }}>Odstrániť pozíciu</Btn>
+                      </div>
+                    </td></tr>
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ fontSize: 11.5, color: C.dim }}>* hviezdička = manuálna cena (bez API kľúča). Riziko na tranžu: A max 1,5 % NLV, B/C max 1 % NLV. Gap a objem sa vyhodnocujú pri obnovení dát.</div>
+    </div>
+  );
+
+  const Watchlist = () => {
+    const upd = (id, patch) => setState(st => ({ ...st, watchlist: st.watchlist.map(w => w.id === id ? { ...w, ...patch } : w) }));
+    return (
+      <div style={{ display: "grid", gap: 14 }}>
+        <div style={{ display: "flex", gap: 10 }}>
+          <Btn kind="primary" onClick={() => setState(st => ({ ...st, watchlist: [...st.watchlist, { id: "w" + Date.now(), level: "C", ticker: "", theme: "Iné", thesis: "", catalyst: "", zoneLow: "", zoneHigh: "", sl: "", size: "", invalidate: "" }] }))}>+ Pridať titul</Btn>
+          <span style={{ fontSize: 12, color: C.mut, alignSelf: "center" }}>A = Ready (hotová analýza, čaká sa na cenu) · B = Monitoring · C = Nápady. A-tituly sa sledujú s trhovými dátami.</span>
+        </div>
+        {["A", "B", "C"].map(lv => (
+          <Panel key={lv} title={`Úroveň ${lv} ${lv === "A" ? "— Ready (zoznam pre prepady, kap. 2.5)" : lv === "B" ? "— Monitoring (1× týždenne)" : "— Nápady (1× mesačne triediť)"}`}>
+            {state.watchlist.filter(w => w.level === lv).length === 0 && <div style={{ fontSize: 12, color: C.dim }}>Prázdne.</div>}
+            {state.watchlist.filter(w => w.level === lv).map(w => {
+              const m = market.tickers[w.ticker];
+              const inZone = m && w.zoneLow && w.zoneHigh && m.price >= +w.zoneLow && m.price <= +w.zoneHigh;
+              return (
+                <div key={w.id} style={{ borderBottom: `1px solid ${C.line}`, padding: "10px 0" }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "90px 70px 1fr 110px 110px 90px 90px 80px", gap: 8, alignItems: "center" }}>
+                    <Input mono placeholder="TICKER" value={w.ticker} onChange={e => upd(w.id, { ticker: e.target.value.toUpperCase() })} />
+                    <Sel value={w.level} onChange={e => upd(w.id, { level: e.target.value })} options={[{ v: "A", l: "A" }, { v: "B", l: "B" }, { v: "C", l: "C" }]} />
+                    <Input placeholder="Téza jednou vetou" value={w.thesis} onChange={e => upd(w.id, { thesis: e.target.value })} />
+                    <Input placeholder="Katalyzátor+dátum" value={w.catalyst} onChange={e => upd(w.id, { catalyst: e.target.value })} />
+                    <div style={{ display: "flex", gap: 4 }}>
+                      <Input mono placeholder="zóna od" value={w.zoneLow} onChange={e => upd(w.id, { zoneLow: e.target.value })} />
+                      <Input mono placeholder="do" value={w.zoneHigh} onChange={e => upd(w.id, { zoneHigh: e.target.value })} />
+                    </div>
+                    <Input mono placeholder="SL návrh" value={w.sl} onChange={e => upd(w.id, { sl: e.target.value })} />
+                    <Input mono placeholder="veľkosť €" value={w.size} onChange={e => upd(w.id, { size: e.target.value })} />
+                    <Btn small kind="danger" onClick={() => setState(st => ({ ...st, watchlist: st.watchlist.filter(x => x.id !== w.id) }))}>✕</Btn>
+                  </div>
+                  <div style={{ display: "flex", gap: 14, marginTop: 5, fontSize: 11.5, alignItems: "center" }}>
+                    {m && <span style={{ fontFamily: MONO, color: inZone ? C.ok : C.mut }}>cena {f2(m.price)} {inZone ? "● VO VSTUPNEJ ZÓNE" : ""}</span>}
+                    <Input placeholder="Čo tézu vyvráti" value={w.invalidate} onChange={e => upd(w.id, { invalidate: e.target.value })} style={{ maxWidth: 360 }} />
+                  </div>
+                </div>
+              );
+            })}
+          </Panel>
+        ))}
+      </div>
+    );
+  };
+
+  const Alerts = () => (
+    <div style={{ display: "grid", gap: 10 }}>
+      <div style={{ fontSize: 12.5, color: C.mut }}>Engine vyhodnocuje pravidlá stratégie pri každej zmene dát. Pre skutočné intradenné push notifikácie nastav cenové alerty v IBKR/TradingView na úrovne SL a vstupných zón — táto appka ti ich vypočíta.</div>
+      {derived.alerts.length === 0 && <Panel><div style={{ color: C.ok }}>Žiadne upozornenia — portfólio je v súlade s pravidlami.</div></Panel>}
+      {derived.alerts.map((a, i) => (
+        <div key={i} style={{ background: C.panel, border: `1px solid ${C.line}`, borderLeft: `3px solid ${sevColor(a.sev)}`, borderRadius: 8, padding: "10px 14px" }}>
+          <div style={{ display: "flex", gap: 10, alignItems: "baseline" }}>
+            <span style={{ fontFamily: MONO, fontSize: 11, fontWeight: 700, color: sevColor(a.sev), minWidth: 80 }}>{a.scope}</span>
+            <span style={{ fontSize: 13.5, color: C.text, fontWeight: 600 }}>{a.msg}</span>
+          </div>
+          <div style={{ fontSize: 12.5, color: C.mut, marginTop: 3, paddingLeft: 90 }}>{a.action}</div>
+        </div>
+      ))}
+    </div>
+  );
+
+  const AITab = () => (
+    <div style={{ display: "grid", gap: 14 }}>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <Btn kind="primary" onClick={dailyReport} disabled={ai.busy}>📋 Vygenerovať denný report</Btn>
+        <span style={{ fontSize: 12, color: C.mut, alignSelf: "center" }}>Report prehľadá web: režim trhu, makro kalendár, earnings tvojich pozícií, news. Per-ticker analýzu spustíš tlačidlom „AI" v Pozíciách (news, guidance, insider, analyst zmeny).</span>
+      </div>
+      {ai.busy && <Panel><div style={{ fontSize: 13, color: C.amber }}>⏳ {ai.title} — prehľadávam web a vyhodnocujem voči pravidlám…</div></Panel>}
+      {ai.err && <Panel><div style={{ fontSize: 13, color: C.bad }}>Chyba: {ai.err}</div></Panel>}
+      {ai.text && <Panel title={ai.title} right={<span style={{ fontSize: 11, color: C.dim }}>{new Date().toLocaleString("sk-SK")}</span>}><Md text={ai.text} /></Panel>}
+      {!ai.busy && !ai.text && !ai.err && <Panel><div style={{ fontSize: 13, color: C.mut }}>Zatiaľ žiadny report. Denný rituál: ráno pred otvorením → obnoviť dáta → denný report → skontrolovať upozornenia → exekúcia podľa plánu, nie z emócie.</div></Panel>}
+    </div>
+  );
+
+  /* ---------- Pravidlá ---------- */
+  const updCat = (k, patch) => {
+    const all = { long: catRule(s, "long"), swing: catRule(s, "swing"), spec: catRule(s, "spec") };
+    setSettings({ catRules: { ...all, [k]: { ...all[k], ...patch } }, rulesChangedAt: new Date().toISOString().slice(0, 10) });
+  };
+  const RulesTab = () => (
+    <div style={{ display: "grid", gap: 14 }}>
+      <div style={{ fontSize: 12.5, color: C.warn, background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "10px 14px" }}>
+        Desatoro č. 10: pravidlá sa menia <b>max 1× za kvartál, na papieri, nikdy v otvorenej pozícii</b> — po strate ich nemeň, najprv zapíš lekciu do denníka.
+        {s.rulesChangedAt && <span style={{ color: C.mut }}> Posledná zmena: {s.rulesChangedAt}.</span>}
+      </div>
+      {Object.entries(CATS).map(([k, c]) => {
+        const cr = catRule(s, k);
+        const full = Math.round(cr.maxPct * s.nlv);
+        const split = String(cr.tranches).split("/").map(x => parseFloat(x) || 0);
+        return (
+          <Panel key={k} title={<span style={{ color: c.color }}>{c.label} — vstupný plán a limity</span>}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12 }}>
+              <label style={{ fontSize: 11, color: C.mut }}>Max % NLV (plná pozícia)
+                <Input mono value={cr.maxPct} onChange={e => updCat(k, { maxPct: +e.target.value || 0 })} />
+              </label>
+              <label style={{ fontSize: 11, color: C.mut }}>Max počet pozícií
+                <Input mono value={cr.maxCount} onChange={e => updCat(k, { maxCount: +e.target.value || 0 })} />
+              </label>
+              <label style={{ fontSize: 11, color: C.mut }}>Východiskový SL (% od vstupu)
+                <Input mono value={cr.slPct} onChange={e => updCat(k, { slPct: +e.target.value || 0 })} />
+              </label>
+              <label style={{ fontSize: 11, color: C.mut }}>Tranže % (vstup/dokup/dokup)
+                <Input mono value={cr.tranches} onChange={e => updCat(k, { tranches: e.target.value })} />
+              </label>
+              {k === "long" && <label style={{ fontSize: 11, color: C.mut }}>Dokup do slabosti od (% pod vstup)
+                <Input mono value={cr.dokupGap} onChange={e => updCat(k, { dokupGap: +e.target.value || 0 })} />
+              </label>}
+              {k !== "long" && <label style={{ fontSize: 11, color: C.mut }}>Časový stop (dni, 0 = vyp.)
+                <Input mono value={cr.timeStopDays} onChange={e => updCat(k, { timeStopDays: +e.target.value || 0 })} />
+              </label>}
+            </div>
+            <div style={{ fontSize: 12, color: C.mut, marginTop: 10, fontFamily: MONO }}>
+              Pri NLV {f0(s.nlv)} €: plná pozícia ≈ <span style={{ color: C.text }}>{f0(full)} €</span> → tranže {split.map((x, i) => <span key={i} style={{ color: C.text }}>{i > 0 ? " + " : ""}{f0(full * x / 100)} €</span>)}
+            </div>
+            <div style={{ fontSize: 11.5, color: C.dim, marginTop: 6 }}>
+              {k === "long" && `Dokupy: do sily (breakout) alebo do slabosti −${cr.dokupGap} až −${cr.dokupGap + 4} % LEN s platnou tézou. Po 3. tranži pozícia uzavretá na pridávanie. SL: −${cr.slPct} % / 200d MA / zlom tézy. TP: +50 % predaj 1/4, +100 % ďalšiu 1/4, zvyšok trailing.`}
+              {k === "swing" && `Dokupy: výhradne do sily (retest breakoutu, +1R). Do straty NIKDY. SL tvrdý −${cr.slPct} % pod swing low, zadaný v platforme. TP: 1/2 na +2R, po +1R SL na BE.`}
+              {k === "spec" && `Vstup vždy s bracketom (SL aj TP hneď). Pyramídovanie len do zisku. SL −${cr.slPct} %, nikdy neposúvať nadol. TP: 1/2 na +20–30 %. Max ${cr.maxCount} naraz, súhrnne ≤10 % NLV. 2× SL po sebe = týždeň pauza.`}
+            </div>
+          </Panel>
+        );
+      })}
+      <Panel title="Limity účtu a rizika">
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 12 }}>
+          {[["Max páka — normál", "maxLevNormal"], ["Max páka — absolútny strop", "maxLevCrash"], ["Min Excess Liq (% NLV)", "minExcessPct"], ["Max počet pozícií spolu", "maxPositions"], ["Max % NLV na tému", "maxThemePct"], ["Riziko/tranžu long swing (% NLV)", "riskTrancheLong"], ["Riziko/tranžu swing+špek (% NLV)", "riskTrancheSwing"], ["Long swing: SL na BE od +%", "longBePct"], ["Rezerva na prepady €", "reserve"]].map(([l, k]) => (
+            <label key={k} style={{ fontSize: 11, color: C.mut }}>{l}
+              <Input mono value={s[k]} onChange={e => setSettings({ [k]: +e.target.value || 0, rulesChangedAt: new Date().toISOString().slice(0, 10) })} />
+            </label>
+          ))}
+        </div>
+        <div style={{ fontSize: 11.5, color: C.dim, marginTop: 8 }}>Percentá zadávaj ako desatinné číslo (0.10 = 10 %). Zmeny sa okamžite premietnu do semaforu, upozornení aj výpočtov tranží.</div>
+      </Panel>
+    </div>
+  );
+
+  /* ---------- Denník ---------- */
+  const jStats = useMemo(() => {
+    const closed = state.journal.filter(e => e.result !== "" && !isNaN(+e.result));
+    const wins = closed.filter(e => +e.result > 0), losses = closed.filter(e => +e.result < 0);
+    const sumR = state.journal.reduce((a, e) => a + (parseFloat(e.resultR) || 0), 0);
+    return {
+      total: state.journal.length, closed: closed.length,
+      winRate: closed.length ? wins.length / closed.length * 100 : null,
+      avgWin: wins.length ? wins.reduce((a, e) => a + +e.result, 0) / wins.length : null,
+      avgLoss: losses.length ? losses.reduce((a, e) => a + +e.result, 0) / losses.length : null,
+      sumR, broken: state.journal.filter(e => e.rules === "Nie").length,
+    };
+  }, [state.journal]);
+  const JournalTab = () => (
+    <div style={{ display: "grid", gap: 14 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 14 }}>
+        {[["Zápisov", jStats.total], ["Uzavretých", jStats.closed], ["Win-rate", jStats.winRate != null ? jStats.winRate.toFixed(0) + " %" : "—"], ["Ø zisk", jStats.avgWin != null ? "+" + f0(jStats.avgWin) + " €" : "—"], ["Ø strata", jStats.avgLoss != null ? f0(jStats.avgLoss) + " €" : "—"], ["Σ R", jStats.sumR ? jStats.sumR.toFixed(1) + "R" : "—"], ["Porušené pravidlá", jStats.broken]].map(([l, v], i) => (
+          <Panel key={i}><div style={{ fontSize: 10.5, color: C.dim, letterSpacing: ".1em", textTransform: "uppercase", marginBottom: 6 }}>{l}</div>
+            <div style={{ fontSize: 20, fontFamily: MONO, fontWeight: 600 }}>{v}</div></Panel>
+        ))}
+      </div>
+      <Panel title="Nový zápis — hneď po obchode, nie večer">
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 10 }}>
+          <label style={{ fontSize: 11, color: C.mut }}>Dátum<Input mono value={jr.date} onChange={e => setJr({ ...jr, date: e.target.value })} /></label>
+          <label style={{ fontSize: 11, color: C.mut }}>Ticker<Input mono value={jr.ticker} onChange={e => setJr({ ...jr, ticker: e.target.value.toUpperCase() })} /></label>
+          <label style={{ fontSize: 11, color: C.mut }}>Kategória<Sel value={jr.cat} onChange={e => setJr({ ...jr, cat: e.target.value })} options={Object.entries(CATS).map(([v, c]) => ({ v, l: c.label }))} /></label>
+          <label style={{ fontSize: 11, color: C.mut }}>Akcia<Sel value={jr.action} onChange={e => setJr({ ...jr, action: e.target.value })} options={["Nákup", "Dokup", "Predaj čiastočný", "Predaj celý", "Zásah SL", "TP"].map(x => ({ v: x, l: x }))} /></label>
+          <label style={{ fontSize: 11, color: C.mut }}>Ks<Input mono value={jr.qty} onChange={e => setJr({ ...jr, qty: e.target.value })} /></label>
+          <label style={{ fontSize: 11, color: C.mut }}>Cena<Input mono value={jr.price} onChange={e => setJr({ ...jr, price: e.target.value })} /></label>
+          <label style={{ fontSize: 11, color: C.mut }}>Plán R (riziko €)<Input mono value={jr.riskPlan} onChange={e => setJr({ ...jr, riskPlan: e.target.value })} /></label>
+          <label style={{ fontSize: 11, color: C.mut }}>Výsledok € (pri uzavretí)<Input mono value={jr.result} onChange={e => setJr({ ...jr, result: e.target.value })} /></label>
+          <label style={{ fontSize: 11, color: C.mut }}>Výsledok R<Input mono value={jr.resultR} onChange={e => setJr({ ...jr, resultR: e.target.value })} /></label>
+          <label style={{ fontSize: 11, color: C.mut }}>Emócia pri vstupe<Input value={jr.emotion} onChange={e => setJr({ ...jr, emotion: e.target.value })} placeholder="pokoj / FOMO / pomsta…" /></label>
+          <label style={{ fontSize: 11, color: C.mut }}>Dodržané pravidlá?<Sel value={jr.rules} onChange={e => setJr({ ...jr, rules: e.target.value })} options={[{ v: "Áno", l: "Áno" }, { v: "Nie", l: "Nie" }]} /></label>
+        </div>
+        <label style={{ fontSize: 11, color: C.mut, display: "block", marginTop: 10 }}>Dôvod / setup<Input value={jr.reason} onChange={e => setJr({ ...jr, reason: e.target.value })} /></label>
+        <label style={{ fontSize: 11, color: C.mut, display: "block", marginTop: 10 }}>Lekcia<Input value={jr.lesson} onChange={e => setJr({ ...jr, lesson: e.target.value })} /></label>
+        <div style={{ marginTop: 12 }}>
+          <Btn kind="primary" onClick={() => {
+            if (!jr.ticker) return;
+            setState(st => ({ ...st, journal: [{ ...jr, id: "j" + Date.now() }, ...st.journal] }));
+            setJr({ ...emptyJr, date: jr.date });
+          }}>Zapísať obchod</Btn>
+        </div>
+      </Panel>
+      <Panel title={`História (${state.journal.length})`}>
+        {state.journal.length === 0 && <div style={{ fontSize: 13, color: C.dim }}>Denník je najrýchlejší učiteľ na svete — prvý zápis sprav pri najbližšom obchode.</div>}
+        <div style={{ overflowX: "auto" }}>
+          {state.journal.map(e => (
+            <div key={e.id} style={{ borderBottom: `1px solid ${C.line}`, padding: "8px 0", fontSize: 12.5 }}>
+              <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "baseline" }}>
+                <span style={{ fontFamily: MONO, color: C.dim }}>{e.date}</span>
+                <span style={{ fontFamily: MONO, fontWeight: 700 }}>{e.ticker}</span>
+                <span style={{ color: CATS[e.cat]?.color, fontSize: 11 }}>{CATS[e.cat]?.label}</span>
+                <span style={{ color: C.mut }}>{e.action} {e.qty} ks @ {e.price}</span>
+                {e.result !== "" && <span style={{ fontFamily: MONO, color: +e.result >= 0 ? C.ok : C.bad }}>{+e.result >= 0 ? "+" : ""}{e.result} € {e.resultR && `(${e.resultR}R)`}</span>}
+                {e.rules === "Nie" && <span style={{ color: C.bad, fontSize: 11 }}>⚠ porušené pravidlá</span>}
+                <span style={{ marginLeft: "auto" }}><Btn small kind="danger" onClick={() => setState(st => ({ ...st, journal: st.journal.filter(x => x.id !== e.id) }))}>✕</Btn></span>
+              </div>
+              {(e.reason || e.emotion || e.lesson) && <div style={{ color: C.mut, marginTop: 3 }}>{e.reason}{e.emotion && ` · emócia: ${e.emotion}`}{e.lesson && ` · lekcia: ${e.lesson}`}</div>}
+            </div>
+          ))}
+        </div>
+      </Panel>
+    </div>
+  );
+
+  /* ---------- AI scout ---------- */
+  const [scoutTheme, setScoutTheme] = useState("");
+  const [scoutNote, setScoutNote] = useState("");
+  const runScout = async () => {
+    setScout({ busy: true, text: "", cands: [], err: "" });
+    const have = [...state.positions.map(p => p.ticker), ...state.watchlist.map(w => w.ticker)].filter(Boolean).join(", ");
+    const prompt = `${STRATEGY_BRIEF}
+
+Moje existujúce tickery (tieto NEnavrhuj): ${have || "žiadne"}.
+Zameranie hľadania: ${scoutTheme || "kdekoľvek"}${scoutNote ? `; doplňujúce kritériá: ${scoutNote}` : ""}.
+
+Postupuj ako analytik podľa mojej metódy hľadania bottleneckov: (1) capex oznámenia veľkých hráčov → kto je úzke hrdlo dodávok; (2) signály z earnings callov dodávateľov („sold out", „lead time", „kapacita rezervovaná"); (3) druhý a tretí rad benefitu trendu (prvý rad už býva zacenený); (4) penetračné krivky 10–50 %; (5) smer revízií odhadov FY+1/FY+2.
+Vyhľadaj na webe AKTUÁLNE informácie a navrhni 4–5 kandidátov vhodných pre kategóriu Long swing alebo Swing. Pre každého stručne: téma, téza jednou vetou, najbližší katalyzátor s dátumom, návrh vstupného setupu, čo tézu vyvráti. Vlastnými slovami, max ~250 slov textu.
+Na ÚPLNOM KONCI povinne pridaj blok presne v tomto formáte:
+\`\`\`json
+[{"ticker":"XYZ","theme":"jedna z: ${THEMES.join(" | ")}","thesis":"...","catalyst":"...","entry":"...","invalidate":"..."}]
+\`\`\`
+Toto je generovanie nápadov na moju vlastnú analýzu, nie investičné odporúčanie.`;
+    try {
+      const text = await askClaude(prompt, true);
+      let cands = [];
+      const m = text.match(/```json([\s\S]*?)```/);
+      if (m) { try { cands = JSON.parse(m[1].trim()); } catch (e) { } }
+      setScout({ busy: false, text: text.replace(/```json[\s\S]*?```/, "").trim(), cands, err: "" });
+    } catch (e) { setScout({ busy: false, text: "", cands: [], err: e.message }); }
+  };
+  const ScoutTab = () => (
+    <div style={{ display: "grid", gap: 14 }}>
+      <Panel title="AI scout — hľadanie kandidátov (metóda kap. 9: bottlenecky a 2.–3. rad benefitu)">
+        <div style={{ display: "grid", gridTemplateColumns: "220px 1fr auto", gap: 10, alignItems: "end" }}>
+          <label style={{ fontSize: 11, color: C.mut }}>Téma (voliteľné)
+            <Sel value={scoutTheme} onChange={e => setScoutTheme(e.target.value)} options={[{ v: "", l: "Kdekoľvek" }, ...THEMES.map(t => ({ v: t, l: t }))]} />
+          </label>
+          <label style={{ fontSize: 11, color: C.mut }}>Doplňujúce kritériá (voliteľné)
+            <Input value={scoutNote} onChange={e => setScoutNote(e.target.value)} placeholder="napr. small caps do 10 mld, earnings do 6 týždňov, mimo USA…" />
+          </label>
+          <Btn kind="primary" onClick={runScout} disabled={scout.busy}>{scout.busy ? "Hľadám…" : "🔍 Nájsť kandidátov"}</Btn>
+        </div>
+        <div style={{ fontSize: 11.5, color: C.dim, marginTop: 8 }}>Scout vylúči tickery, ktoré už máš v portfóliu alebo watchliste. Výstup je nápad na tvoju analýzu — pred vstupom vždy 5 otázok z kap. 2.1 a karta titulu.</div>
+      </Panel>
+      {scout.busy && <Panel><div style={{ fontSize: 13, color: C.amber }}>⏳ Prehľadávam capex správy, earnings cally a revízie odhadov…</div></Panel>}
+      {scout.err && <Panel><div style={{ fontSize: 13, color: C.bad }}>Chyba: {scout.err}</div></Panel>}
+      {scout.cands.length > 0 && (
+        <Panel title="Kandidáti — jedným klikom do watchlistu (úroveň C → Nápady)">
+          {scout.cands.map((c, i) => {
+            const exists = state.watchlist.some(w => w.ticker === String(c.ticker).toUpperCase());
+            return (
+              <div key={i} style={{ borderBottom: `1px solid ${C.line}`, padding: "10px 0", display: "flex", gap: 12, alignItems: "flex-start" }}>
+                <div style={{ flex: 1 }}>
+                  <div><span style={{ fontFamily: MONO, fontWeight: 700, fontSize: 14 }}>{c.ticker}</span> <span style={{ fontSize: 11, color: C.info }}>{c.theme}</span></div>
+                  <div style={{ fontSize: 12.5, color: C.text, marginTop: 2 }}>{c.thesis}</div>
+                  <div style={{ fontSize: 11.5, color: C.mut, marginTop: 2 }}>Katalyzátor: {c.catalyst} · Vstup: {c.entry} · Vyvráti: {c.invalidate}</div>
+                </div>
+                <Btn small disabled={exists} onClick={() => setState(st => ({ ...st, watchlist: [...st.watchlist, { id: "w" + Date.now() + i, level: "C", ticker: String(c.ticker).toUpperCase(), theme: THEMES.includes(c.theme) ? c.theme : "Iné", thesis: c.thesis || "", catalyst: c.catalyst || "", zoneLow: "", zoneHigh: "", sl: "", size: "", invalidate: c.invalidate || "" }] }))}>{exists ? "Vo watchliste" : "+ Watchlist"}</Btn>
+              </div>
+            );
+          })}
+        </Panel>
+      )}
+      {scout.text && <Panel title="Analýza scouta"><Md text={scout.text} /></Panel>}
+      {!scout.busy && !scout.text && !scout.err && <Panel><div style={{ fontSize: 13, color: C.mut }}>Rituál: spusti raz týždenne (nedeľa) alebo keď uvoľníš kapitál. Nápady triedi do C, po vlastnej analýze posuň na B/A.</div></Panel>}
+    </div>
+  );
+
+  const ImportTab = () => {
+    const txt = impTxt, setTxt = setImpTxt, mode = impMode;
+    return (
+      <div style={{ display: "grid", gap: 14 }}>
+        <Panel title="Cloud sync — automatický import z IBKR (každú hodinu)">
+          <div style={{ fontSize: 12.5, color: C.mut, lineHeight: 1.6, marginBottom: 10 }}>
+            Postup (raz, ~15 min): 1. V IBKR vytvor <b style={{ color: C.text }}>Flex Query</b> „Open Positions" (+ voliteľne NAV) a aktivuj <b style={{ color: C.text }}>Flex Web Service</b> (dostaneš token). 2. Nasaď priložený Google Apps Script — ten každú hodinu stiahne dáta z IBKR a vystaví ich ako JSON. 3. URL nasadeného skriptu vlož sem.
+            <br />Sync <b style={{ color: C.text }}>zachová</b> tvoje kategórie, témy, tézy, SL a TP — aktualizuje len kusy, priemernú cenu a pridá nové pozície. NLV a Excess Liquidity sa prepíšu, ak ich endpoint posiela. Pozície zatvorené v IBKR sa nemažú automaticky — appka ich len vypíše, zmažeš ich sám (môžu byť zámerne mimo sync-u).
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: 10, alignItems: "end" }}>
+            <label style={{ fontSize: 11, color: C.mut }}>URL cloud endpointu (Apps Script web app)
+              <Input mono value={s.cloudUrl} onChange={e => setSettings({ cloudUrl: e.target.value })} placeholder="https://script.google.com/macros/s/…/exec?key=…" />
+            </label>
+            <Btn kind="primary" onClick={() => fetchCloud()} disabled={cloud.busy}>{cloud.busy ? "Sťahujem…" : "↻ Synchronizovať teraz"}</Btn>
+            <label style={{ fontSize: 11, color: C.mut, display: "flex", gap: 6, alignItems: "center", paddingBottom: 8 }}>
+              <input type="checkbox" checked={!!s.cloudAuto} onChange={e => setSettings({ cloudAuto: e.target.checked })} /> auto pri otvorení
+            </label>
+          </div>
+          {cloud.msg && <div style={{ fontSize: 12, color: cloud.msg.includes("zlyhal") ? C.bad : C.ok, marginTop: 8 }}>{cloud.msg}</div>}
+          {cloud.closed.length > 0 && <div style={{ fontSize: 12, color: C.warn, marginTop: 4 }}>V cloude už nie sú (asi zatvorené v IBKR): {cloud.closed.join(", ")} — zváž odstránenie v Pozíciách.</div>}
+
+          <div style={{ borderTop: `1px solid ${C.line}`, marginTop: 14, paddingTop: 12 }}>
+            <div style={{ fontSize: 11, letterSpacing: ".1em", color: C.mut, textTransform: "uppercase", fontWeight: 600, marginBottom: 6 }}>Synchronizácia stavu — mobil ↔ PC (vyžaduje skript v2)</div>
+            <div style={{ fontSize: 12.5, color: C.mut, lineHeight: 1.6, marginBottom: 10 }}>
+              Celý stav appky (kategórie, tézy, SL/TP, pravidlá, watchlist, denník) sa ukladá do súboru v tvojom Google Drive a pri otvorení na inom zariadení sa automaticky načíta. Platí „posledná zmena vyhráva" — needituj naraz na dvoch zariadeniach.
+            </div>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+              <label style={{ fontSize: 12, color: C.mut, display: "flex", gap: 6, alignItems: "center" }}>
+                <input type="checkbox" checked={!!s.stateSync} onChange={e => setSettings({ stateSync: e.target.checked })} /> automaticky (pri otvorení načítať, pri zmene uložiť)
+              </label>
+              <Btn small onClick={() => pushState(true)}>⤒ Uložiť stav do cloudu</Btn>
+              <Btn small onClick={() => pullState(true)}>⤓ Načítať stav z cloudu</Btn>
+            </div>
+            {syncMsg && <div style={{ fontSize: 12, color: syncMsg.includes("zlyhal") ? C.bad : C.ok, marginTop: 8 }}>{syncMsg}</div>}
+          </div>
+          <div style={{ fontSize: 11.5, color: C.dim, marginTop: 8 }}>
+            Bezpečnosť: Flex token zostáva len v tvojom Apps Scripte, do appky sa nikdy nezadáva. Endpoint chráň tajným ?key= parametrom (skript ho kontroluje) — URL s kľúčom nikomu neposielaj. Token je len na čítanie reportov, obchodovať sa cez neho nedá.
+          </div>
+        </Panel>
+
+        <Panel title="Import pozícií z IBKR">
+          <div style={{ fontSize: 12.5, color: C.mut, lineHeight: 1.6, marginBottom: 10 }}>
+            Ručná alternatíva k cloud sync-u. Priame API spojenie s IBKR z prehliadača nie je možné (gateway beží lokálne a vyžaduje prihlásenie — prihlasovacie údaje do appky nikdy nezadávaj). Postup:
+            <br />1. <b style={{ color: C.text }}>Najspoľahlivejšie:</b> otvor svoju cloud URL (s ?key=…) v novom okne prehliadača, skopíruj celý JSON (Ctrl+A, Ctrl+C) a vlož ho sem — appka ho spozná, zachová tvoje kategórie/tézy/SL a aktualizuje aj NLV.
+            <br />2. Alebo IBKR → Performance &amp; Reports → <b style={{ color: C.text }}>Flex Queries</b> → spusti query → stiahni CSV a vlož sem. Funguje aj kópia portfólia z TWS/Portalu (tab/;/, oddeľovač).
+            <br />3. Po importe doplň ku každej pozícii <b style={{ color: C.text }}>kategóriu, tému, tézu a SL</b> — bez nich engine hlási porušenie pravidiel (zámerne).
+          </div>
+          <textarea value={txt} onChange={e => setTxt(e.target.value)} placeholder={'Vlož JSON z cloud endpointu  {"generated":…,"positions":[…]}\nalebo CSV:  Symbol,Quantity,CostBasisPrice,MarkPrice'} style={{ width: "100%", minHeight: 130, background: C.bg, border: `1px solid ${C.line}`, color: C.text, borderRadius: 8, padding: 10, fontFamily: MONO, fontSize: 12.5, boxSizing: "border-box" }} />
+          <div style={{ display: "flex", gap: 10, marginTop: 10, alignItems: "center" }}>
+            <Sel value={mode} onChange={e => setImpMode(e.target.value)} options={[{ v: "replace", l: "Nahradiť celé portfólio" }, { v: "append", l: "Pridať k existujúcim" }]} />
+            <Btn kind="primary" onClick={() => {
+              const t = txt.trim();
+              if (t.startsWith("{") || t.startsWith("[")) {
+                try {
+                  const j = JSON.parse(t);
+                  const rows = Array.isArray(j) ? j : j.positions || [];
+                  if (!rows.length) { setCloud(c => ({ ...c, msg: "JSON neobsahuje žiadne pozície." })); return; }
+                  setState(st => {
+                    const { merged, closedTickers } = mergeCloudPositions(st.positions, rows);
+                    const keep = mode === "append" ? st.positions.filter(p => closedTickers.includes(p.ticker)) : [];
+                    const settings = { ...st.settings };
+                    if (j.nlv) settings.nlv = Math.round(+j.nlv);
+                    if (j.excessLiq) settings.excessLiq = Math.round(+j.excessLiq);
+                    setCloud({ busy: false, msg: `Importované ${merged.length} pozícií z JSON${j.nlv ? `, NLV ${Math.round(+j.nlv)} €` : ""}.`, closed: mode === "append" ? [] : closedTickers });
+                    return { ...st, settings, positions: [...merged, ...keep] };
+                  });
+                  setTxt(""); setTab("pos");
+                } catch (e) { setCloud(c => ({ ...c, msg: "JSON sa nepodarilo prečítať: " + e.message })); }
+                return;
+              }
+              const rows = parseImport(txt);
+              if (!rows.length) return;
+              setState(st => ({ ...st, positions: mode === "replace" ? rows : [...st.positions, ...rows] }));
+              setTxt(""); setTab("pos");
+            }}>Importovať</Btn>
+          </div>
+        </Panel>
+
+        <Panel title="Nastavenia účtu a limity (z hárku Nastavenia)">
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 12 }}>
+            {[["NLV € (aktualizuj z IBKR)", "nlv"], ["Excess Liquidity €", "excessLiq"], ["Max páka — normál", "maxLevNormal"], ["Max páka — strop", "maxLevCrash"], ["Min Excess Liq (% NLV, 0.3=30%)", "minExcessPct"], ["Max počet pozícií", "maxPositions"], ["Max % NLV / téma (0.4=40%)", "maxThemePct"], ["Rezerva na prepady €", "reserve"], ["VIX (manuálne, voliteľné)", "vixManual"]].map(([l, k]) => (
+              <label key={k} style={{ fontSize: 11, color: C.mut }}>{l}
+                <Input mono value={s[k]} onChange={e => setSettings({ [k]: k === "vixManual" ? e.target.value : +e.target.value || 0 })} />
+              </label>
+            ))}
+          </div>
+        </Panel>
+
+        <Panel title="Trhové dáta (RSI, SMA, ATR, objem, gapy)">
+          <div style={{ fontSize: 12.5, color: C.mut, lineHeight: 1.6, marginBottom: 10 }}>
+            Na výpočet indikátorov appka potrebuje denné OHLC dáta. Zaregistruj si <b style={{ color: C.text }}>vlastný bezplatný API kľúč na twelvedata.com</b> (free: 8 požiadaviek/min, 800/deň — stačí na portfólio tejto veľkosti) a vlož ho sem. Kľúč sa ukladá len v tvojom úložisku tejto appky. Bez kľúča appka beží na manuálnych cenách.
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 180px", gap: 12 }}>
+            <label style={{ fontSize: 11, color: C.mut }}>Twelve Data API kľúč
+              <Input mono type="password" value={s.tdKey} onChange={e => setSettings({ tdKey: e.target.value })} placeholder="vlož svoj kľúč" />
+            </label>
+            <label style={{ fontSize: 11, color: C.mut }}>Auto-refresh (min, 0 = vyp.)
+              <Input mono value={s.autoRefreshMin} onChange={e => setSettings({ autoRefreshMin: +e.target.value || 0 })} />
+            </label>
+          </div>
+        </Panel>
+      </div>
+    );
+  };
+
+  /* ---------- layout ---------- */
+  const tabs = [["dash", "Dashboard"], ["pos", `Pozície (${state.positions.length})`], ["wl", "Watchlist"], ["alerts", `Upozornenia (${derived.alerts.length})`], ["journal", "Denník"], ["scout", "AI scout"], ["ai", "AI analytik"], ["rules", "Pravidlá"], ["imp", "Import · Nastavenia"]];
+  const badCount = derived.alerts.filter(a => a.sev === "bad").length;
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: SANS, padding: "0 0 40px" }}>
+      <div style={{ borderBottom: `1px solid ${C.line}`, background: C.panel }}>
+        <div style={{ maxWidth: 1280, margin: "0 auto", padding: "16px 20px 0" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", flexWrap: "wrap", gap: 8 }}>
+            <div>
+              <div style={{ fontSize: 10, letterSpacing: ".3em", color: C.amber, fontWeight: 700 }}>SWING STRATÉGIA v1.0 · IBKR</div>
+              <div style={{ fontSize: 21, fontWeight: 700, letterSpacing: "-.01em" }}>Command Center</div>
+            </div>
+            <div style={{ fontSize: 11, color: C.dim }}>Rámec disciplíny, nie investičné poradenstvo · revízia pravidiel: 09/2026</div>
+          </div>
+
+          {/* SEMAFOR — podpisový prvok */}
+          <div style={{ display: "flex", flexWrap: "wrap", border: `1px solid ${C.line}`, borderRadius: 8, margin: "12px 0", background: C.bg, overflow: "hidden" }}>
+            <Light ok={T.lev <= s.maxLevNormal} warn={T.lev <= s.maxLevCrash} label="Páka" value={`${T.lev.toFixed(2)}× / ${s.maxLevNormal}×`} />
+            <Light ok={s.excessLiq >= s.minExcessPct * s.nlv} warn={s.excessLiq >= 0.15 * Math.max(T.value, 1)} label="Likvidita" value={`${f0(s.excessLiq)} €`} />
+            <Light ok={state.positions.length <= s.maxPositions} warn={state.positions.length <= s.maxPositions + 4} label="Pozície" value={`${state.positions.length} / ${s.maxPositions}`} />
+            <Light ok={T.riskPct <= 0.08} warn={T.riskPct <= 0.12} label="Riziko" value={`${(T.riskPct * 100).toFixed(1)} % NLV`} />
+            <Light ok={!derived.themes.some(t => t.pct > s.maxThemePct)} warn={true} label="Témy" value={derived.themes.some(t => t.pct > s.maxThemePct) ? "limit prekročený" : "≤ 40 %"} />
+            <Light ok={spyTrendOk === true} warn={spyTrendOk === null} label="Trh (SPY vs 50d)" value={spy ? `${f2(spy.price)} ${spyTrendOk ? "↑" : "↓"}` : "bez dát"} />
+            <Light ok={badCount === 0} warn={badCount === 0} label="Porušenia" value={badCount === 0 ? "žiadne" : `${badCount} kritické`} />
+          </div>
+
+          <div style={{ display: "flex", gap: 2, flexWrap: "wrap" }}>
+            {tabs.map(([k, l]) => (
+              <button key={k} onClick={() => setTab(k)} style={{
+                background: "transparent", border: "none", borderBottom: `2px solid ${tab === k ? C.amber : "transparent"}`,
+                color: tab === k ? C.text : C.mut, padding: "9px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: SANS,
+              }}>{l}</button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 1280, margin: "0 auto", padding: "18px 20px" }}>
+        {tab === "dash" && Dashboard()}
+        {tab === "pos" && Positions()}
+        {tab === "wl" && Watchlist()}
+        {tab === "alerts" && Alerts()}
+        {tab === "journal" && JournalTab()}
+        {tab === "scout" && ScoutTab()}
+        {tab === "ai" && AITab()}
+        {tab === "rules" && RulesTab()}
+        {tab === "imp" && ImportTab()}
+      </div>
+    </div>
+  );
+}
+
+const tdN = { padding: "8px", textAlign: "right", fontFamily: MONO, color: "#8C97A6", whiteSpace: "nowrap" };
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
