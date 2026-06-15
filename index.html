@@ -286,6 +286,24 @@ function parseImport(text) {
   }).filter(Boolean);
 }
 
+/* ---------------- JSONP (obchádza CORS Google Apps Scriptu) ---------------- */
+function jsonp(baseUrl, extraParams, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const cb = "__jsonp_cb_" + Math.random().toString(36).slice(2);
+    const sep = baseUrl.includes("?") ? "&" : "?";
+    const params = Object.entries(extraParams || {}).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
+    const src = `${baseUrl}${sep}callback=${cb}${params ? "&" + params : ""}`;
+    const script = document.createElement("script");
+    let done = false;
+    const cleanup = () => { delete window[cb]; if (script.parentNode) script.parentNode.removeChild(script); };
+    const timer = setTimeout(() => { if (!done) { done = true; cleanup(); reject(new Error("vypršal čas (timeout)")); } }, timeoutMs || 20000);
+    window[cb] = (data) => { if (done) return; done = true; clearTimeout(timer); cleanup(); resolve(data); };
+    script.onerror = () => { if (done) return; done = true; clearTimeout(timer); cleanup(); reject(new Error("script sa nenačítal (URL alebo sieť)")); };
+    script.src = src;
+    document.body.appendChild(script);
+  });
+}
+
 /* ---------------- cloud sync (IBKR Flex → Apps Script → JSON) ---------------- */
 function mergeCloudPositions(existing, cloudRows) {
   // cloudRows: [{ticker, qty, avg, price}] — zachová kategóriu, tému, tézu, SL, TP existujúcich pozícií
@@ -337,13 +355,21 @@ function App() {
     try {
       const savedAt = new Date().toISOString();
       const payload = { settings: st.settings, positions: st.positions, watchlist: st.watchlist, journal: st.journal, savedAt };
-      const r = await fetch(stateUrl(u), { method: "POST", body: JSON.stringify(payload) });
-      const j = await r.json();
+      const data = JSON.stringify(payload);
+      if (data.length > 7000) {
+        // príliš veľké na GET URL — skús no-cors POST (uloží sa, odpoveď nečítame)
+        await fetch(stateUrl(u), { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: data });
+        savedAtRef.current = savedAt;
+        if (manual) setSyncMsg(`Stav uložený (POST) ${new Date().toLocaleTimeString("sk-SK")} ✓`);
+        return;
+      }
+      const j = await jsonp(u, { save: "1", data });
       if (!j.ok) throw new Error(j.error || "neočakávaná odpoveď");
       savedAtRef.current = savedAt;
-      setSyncMsg(`Stav uložený do cloudu ${new Date().toLocaleTimeString("sk-SK")} ✓`);
+      if (manual) setSyncMsg(`Stav uložený do cloudu ${new Date().toLocaleTimeString("sk-SK")} ✓`);
+      else setSyncMsg(`Stav uložený ${new Date().toLocaleTimeString("sk-SK")} ✓`);
     } catch (e) {
-      if (manual) setSyncMsg(`Uloženie stavu zlyhalo: ${e.message}${/Failed to fetch/i.test(e.message) ? " (v Claude sandboxe sync nefunguje — funguje na webe/mobile/stiahnutej verzii)" : ""}`);
+      if (manual) setSyncMsg(`Uloženie stavu zlyhalo: ${e.message}`);
     }
   }, []);
 
@@ -351,11 +377,10 @@ function App() {
     const u = stateRef.current.settings.cloudUrl?.trim();
     if (!u) { if (manual) setSyncMsg("Zadaj URL cloud endpointu."); return; }
     try {
-      const r = await fetch(stateUrl(u));
-      const j = await r.json();
+      const j = await jsonp(u, { state: "1" });
       if (j.error) throw new Error(j.error);
       if (j.empty || !j.positions) { if (manual) setSyncMsg("V cloude zatiaľ nie je uložený žiadny stav — ulož ho z tohto zariadenia."); return; }
-      if (!manual && j.savedAt && savedAtRef.current && j.savedAt <= savedAtRef.current) return; // lokálny je novší
+      if (!manual && j.savedAt && savedAtRef.current && j.savedAt <= savedAtRef.current) return;
       setState(st => ({
         settings: { ...DEFAULT_SETTINGS, ...j.settings, catRules: { long: catRule(j.settings || {}, "long"), swing: catRule(j.settings || {}, "swing"), spec: catRule(j.settings || {}, "spec") } },
         positions: j.positions, watchlist: j.watchlist || st.watchlist, journal: j.journal || st.journal,
@@ -363,7 +388,7 @@ function App() {
       savedAtRef.current = j.savedAt || new Date().toISOString();
       setSyncMsg(`Stav načítaný z cloudu (uložený ${j.savedAt ? new Date(j.savedAt).toLocaleString("sk-SK") : "?"}) ✓`);
     } catch (e) {
-      if (manual) setSyncMsg(`Načítanie stavu zlyhalo: ${e.message}${/Failed to fetch/i.test(e.message) ? " (v Claude sandboxe sync nefunguje — funguje na webe/mobile/stiahnutej verzii)" : ""}`);
+      if (manual) setSyncMsg(`Načítanie stavu zlyhalo: ${e.message}`);
     }
   }, []);
 
@@ -372,9 +397,8 @@ function App() {
     if (!u) { setCloud(c => ({ ...c, msg: "Zadaj URL cloud endpointu v Nastaveniach." })); return; }
     setCloud({ busy: true, msg: "Sťahujem dáta z cloudu…", closed: [] });
     try {
-      const r = await fetch(u, { redirect: "follow" });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const j = await r.json();
+      const j = await jsonp(u, {});
+      if (j.error) throw new Error(j.error === "unauthorized" ? "kľúč nesedí (?key=)" : j.error);
       const rows = Array.isArray(j) ? j : j.positions || [];
       if (!rows.length) throw new Error("Endpoint nevrátil žiadne pozície (skontroluj Flex Query a skript).");
       setState(st => {
@@ -386,7 +410,7 @@ function App() {
         return { ...st, settings, positions: merged };
       });
     } catch (e) {
-      setCloud({ busy: false, msg: `Cloud sync zlyhal: ${e.message}. Ak ti URL v prehliadači ukazuje JSON, sandbox appky blokuje pripojenie — použi vloženie JSON v paneli Import nižšie (funguje vždy).`, closed: [] });
+      setCloud({ busy: false, msg: `Cloud sync zlyhal: ${e.message}. Over, že URL v prehliadači ukazuje JSON a že skript je vo verzii v3 (JSONP).`, closed: [] });
     }
   }, [state.settings.cloudUrl]);
 
@@ -1056,6 +1080,19 @@ Toto je generovanie nápadov na moju vlastnú analýzu, nie investičné odporú
               </label>
               <Btn small onClick={() => pushState(true)}>⤒ Uložiť stav do cloudu</Btn>
               <Btn small onClick={() => pullState(true)}>⤓ Načítať stav z cloudu</Btn>
+              <Btn small onClick={async () => {
+                const u = s.cloudUrl.trim();
+                if (!u) { setSyncMsg("Najprv vlož URL."); return; }
+                setSyncMsg("Testujem spojenie (JSONP)…");
+                try {
+                  const j = await jsonp(u, {});
+                  if (j.error === "unauthorized") setSyncMsg("⚠ Spojenie OK, ale kľúč nesedí: za ?key= v URL musí byť presne APP_KEY zo Script Properties.");
+                  else if (j.positions) setSyncMsg(`✓ Spojenie funguje! Endpoint vrátil ${j.positions.length} pozícií. Klikni Synchronizovať teraz.`);
+                  else setSyncMsg("Odpoveď prišla, ale bez pozícií: " + JSON.stringify(j).slice(0, 120));
+                } catch (e) {
+                  setSyncMsg(`✗ ${e.message}. Skontroluj: (1) skript je vo verzii v3 s JSONP a znovu nasadený (New version), (2) URL je správna aj s ?key=.`);
+                }
+              }}>⚙ Test spojenia</Btn>
             </div>
             {syncMsg && <div style={{ fontSize: 12, color: syncMsg.includes("zlyhal") ? C.bad : C.ok, marginTop: 8 }}>{syncMsg}</div>}
           </div>
