@@ -289,16 +289,33 @@ function parseImport(text) {
 /* ---------------- JSONP (obchádza CORS Google Apps Scriptu) ---------------- */
 function jsonp(baseUrl, extraParams, timeoutMs) {
   return new Promise((resolve, reject) => {
+    const clean = String(baseUrl).trim().replace(/\s+/g, "");
+    if (!/^https:\/\/script\.google(usercontent)?\.com\//.test(clean)) {
+      reject(new Error("URL nevyzerá ako Apps Script /exec adresa")); return;
+    }
     const cb = "__jsonp_cb_" + Math.random().toString(36).slice(2);
-    const sep = baseUrl.includes("?") ? "&" : "?";
+    const sep = clean.includes("?") ? "&" : "?";
     const params = Object.entries(extraParams || {}).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
-    const src = `${baseUrl}${sep}callback=${cb}${params ? "&" + params : ""}`;
+    const src = `${clean}${sep}callback=${cb}${params ? "&" + params : ""}`;
     const script = document.createElement("script");
     let done = false;
-    const cleanup = () => { delete window[cb]; if (script.parentNode) script.parentNode.removeChild(script); };
-    const timer = setTimeout(() => { if (!done) { done = true; cleanup(); reject(new Error("vypršal čas (timeout)")); } }, timeoutMs || 20000);
-    window[cb] = (data) => { if (done) return; done = true; clearTimeout(timer); cleanup(); resolve(data); };
-    script.onerror = () => { if (done) return; done = true; clearTimeout(timer); cleanup(); reject(new Error("script sa nenačítal (URL alebo sieť)")); };
+    const finish = (fn, arg) => { if (done) return; done = true; clearTimeout(timer); delete window[cb]; if (script.parentNode) script.parentNode.removeChild(script); fn(arg); };
+    const timer = setTimeout(() => {
+      // JSONP timeout → skús fetch fallback (niektoré mobilné prehliadače blokujú injektovaný <script>)
+      if (done) return;
+      const furl = `${clean}${sep}${params}`;
+      fetch(furl, { redirect: "follow" }).then(r => r.text()).then(t => {
+        try { finish(resolve, JSON.parse(t)); } catch (e) { finish(reject, new Error("odpoveď sa nedá prečítať")); }
+      }).catch(() => finish(reject, new Error("vypršal čas aj fetch (skús iný prehliadač / over URL)")));
+    }, timeoutMs || 12000);
+    window[cb] = (data) => finish(resolve, data);
+    script.onerror = () => {
+      if (done) return;
+      const furl = `${clean}${sep}${params}`;
+      fetch(furl, { redirect: "follow" }).then(r => r.text()).then(t => {
+        try { finish(resolve, JSON.parse(t)); } catch (e) { finish(reject, new Error("script sa nenačítal a fetch zlyhal")); }
+      }).catch(() => finish(reject, new Error("script sa nenačítal (URL alebo sieť)")));
+    };
     script.src = src;
     document.body.appendChild(script);
   });
@@ -1176,7 +1193,7 @@ Toto je generovanie nápadov na moju vlastnú analýzu, nie investičné odporú
         <div style={{ maxWidth: 1280, margin: "0 auto", padding: "16px 20px 0" }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", flexWrap: "wrap", gap: 8 }}>
             <div>
-              <div style={{ fontSize: 10, letterSpacing: ".3em", color: C.amber, fontWeight: 700 }}>SWING STRATÉGIA v1.0 · IBKR</div>
+              <div style={{ fontSize: 10, letterSpacing: ".3em", color: C.amber, fontWeight: 700 }}>SWING STRATÉGIA v1.0 · IBKR · build 4 (mobil-fix)</div>
               <div style={{ fontSize: 21, fontWeight: 700, letterSpacing: "-.01em" }}>Command Center</div>
             </div>
             <div style={{ fontSize: 11, color: C.dim }}>Rámec disciplíny, nie investičné poradenstvo · revízia pravidiel: 09/2026</div>
